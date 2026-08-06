@@ -1,91 +1,122 @@
 #include <Arduino.h>
-#include <ArduinoBLE.h>
 
+#include "AlgoParams.hpp"
+#include "buffers/RingBuffer.hpp"
+#include "drivers/Lsm6ds3Sensor.h"
+#include "hal/SampleTimer.h"
+#include "streaming/DebugCli.h"
+#include "streaming/SerialStreamer.h"
 
-BLEService stepService("180A");
+namespace
+{
+/// Ring buffer used to queue raw samples before streaming.
+SampleRingBuffer<AlgoParams::RING_BUFFER_CAPACITY> sampleBuffer;
 
-BLEIntCharacteristic stepCharacteristic(
-  "2A57",
-  BLERead | BLENotify
-);
+/// IMU sensor interface implementation.
+Lsm6ds3Sensor sensor;
 
+/// Hardware timer that triggers sampling at a fixed interval.
+SampleTimer sampleTimer;
 
-uint32_t stepCount = 0;
+/// Serial streamer used to output CSV samples and stats.
+SerialStreamer streamer;
 
-unsigned long lastStep = 0;
+/// Debug CLI used for command processing over serial.
+DebugCli cli;
 
+/// Monotonic sequence number for each sample.
+uint32_t sampleSequence = 0;
 
-#define LED_PIN LED_BUILTIN
-
+/// Count of samples queued since the last statistics report.
+uint32_t statWindowSamples = 0;
+} // namespace
 
 void setup()
 {
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, HIGH);
-
-
-    Serial.begin(115200);
-
+    Serial.begin(AlgoParams::SERIAL_BAUD);
     delay(1000);
 
-    Serial.println("StepMaster BLE Simulator");
+    Serial.println(F("Ankle Motion Tracker M1"));
 
-
-    if (!BLE.begin())
+    // Initialize the IMU sensor and fail fast if initialization fails.
+    if (!sensor.begin())
     {
-        Serial.println("BLE initialization failed!");
-        while (1);
+        Serial.println(F("ERR IMU init failed"));
+        while (true)
+        {
+            delay(1000);
+        }
     }
 
+    sampleBuffer.clear();
+    streamer.begin();
+    cli.begin(&streamer);
 
-    BLE.setLocalName("StepMaster_XIAO");
+    // Start the sample timer used to generate periodic sensor reads.
+    if (!sampleTimer.begin(AlgoParams::SAMPLE_INTERVAL_US))
+    {
+        Serial.println(F("ERR sample timer init failed"));
+        while (true)
+        {
+            delay(1000);
+        }
+    }
 
-    BLE.setAdvertisedService(stepService);
-
-
-    stepService.addCharacteristic(stepCharacteristic);
-
-    BLE.addService(stepService);
-
-
-    stepCharacteristic.writeValue(stepCount);
-
-
-    BLE.advertise();
-
-
-    Serial.println("BLE advertising started");
+    Serial.println(F("READY streaming at 100 Hz"));
 }
-
-
 
 void loop()
 {
-    BLE.poll();
-
-
-    if (millis() - lastStep >= 10000)
+    // Read sensor data only when the timer interrupt has signaled that a sample is due.
+    if (g_sampleDue)
     {
-        lastStep = millis();
+        g_sampleDue = false;
 
-        stepCount++;
+        MotionData motion{};
+        if (!sensor.read(motion))
+        {
+            // Preserve the current error count for CLI diagnostics.
+            cli.setI2cErrors(sensor.i2cErrorCount());
+        }
+        else
+        {
+            // Populate a raw sample object from the latest motion data.
+            RawSample sample{};
+            sample.sequence = ++sampleSequence;
+            sample.timestampMs = millis();
+            sample.ax = motion.accelX;
+            sample.ay = motion.accelY;
+            sample.az = motion.accelZ;
+            sample.gx = motion.gyroX;
+            sample.gy = motion.gyroY;
+            sample.gz = motion.gyroZ;
 
-
-        Serial.print("STEP: ");
-        Serial.println(stepCount);
-
-
-        // LED ON 200ms
-        digitalWrite(LED_PIN, LOW);
-        delay(200);
-        digitalWrite(LED_PIN, HIGH);
-
-
-
-        // BLE update
-        stepCharacteristic.writeValue(stepCount);
-
-
-        Serial.println("BLE step notification sent");
+            // Attempt to queue the sample into the ring buffer.
+            if (!sampleBuffer.push(sample))
+            {
+#if ENABLE_SAMPLE_DROP_COUNTER
+                ++g_sampleDrops;
+#endif
+            }
+            else
+            {
+                ++statWindowSamples;
+            }
+        }
     }
+
+    // Send any queued samples over the serial stream.
+    RawSample outgoing{};
+    while (sampleBuffer.pop(outgoing))
+    {
+        streamer.streamSample(outgoing);
+    }
+
+    // Update CLI internal counters and process pending commands.
+    cli.setSampleCount(sampleSequence);
+    cli.setI2cErrors(sensor.i2cErrorCount());
+    cli.poll();
+
+    // Print periodic statistics if the stat interval has elapsed.
+    streamer.maybePrintStats(statWindowSamples, sensor.i2cErrorCount());
 }
