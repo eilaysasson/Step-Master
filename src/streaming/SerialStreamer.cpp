@@ -23,34 +23,28 @@ bool SerialStreamer::enabled() const
 }
 
 void SerialStreamer::streamSample(const RawSample& sample)
-{
-#if ENABLE_STREAMING
-    if (!enabled_)
     {
-        // Skip serial output when streaming has been turned off.
-        return;
-    }
+    #if ENABLE_STREAMING
+        if (!enabled_)
+        {
+            return;
+        }
 
-    // Print a CSV-formatted sample line for external logging.
-    Serial.print(F("S,"));
-    Serial.print(sample.sequence);
-    Serial.print(F(","));
-    Serial.print(sample.timestampMs);
-    Serial.print(F(","));
-    Serial.print(sample.ax, STREAM_DECIMAL_PLACES);
-    Serial.print(F(","));
-    Serial.print(sample.ay, STREAM_DECIMAL_PLACES);
-    Serial.print(F(","));
-    Serial.print(sample.az, STREAM_DECIMAL_PLACES);
-    Serial.print(F(","));
-    Serial.print(sample.gx, STREAM_DECIMAL_PLACES);
-    Serial.print(F(","));
-    Serial.print(sample.gy, STREAM_DECIMAL_PLACES);
-    Serial.print(F(","));
-    Serial.print(sample.gz, STREAM_DECIMAL_PLACES);
-    Serial.println();
-#endif
-}
+        // Teleplot Format: >VariableName:Value
+        // Stream accelerometer axes
+        Serial.print(F(">Accel_X:"));
+        Serial.println(sample.ax, STREAM_DECIMAL_PLACES);
+        Serial.print(F(">Accel_Y:"));
+        Serial.println(sample.ay, STREAM_DECIMAL_PLACES);
+        Serial.print(F(">Accel_Z:"));
+        Serial.println(sample.az, STREAM_DECIMAL_PLACES);
+
+        // Stream gyroscope axes
+        Serial.print(F(">Gyro_X:")); Serial.println(sample.gx, STREAM_DECIMAL_PLACES);
+        Serial.print(F(">Gyro_Y:")); Serial.println(sample.gy, STREAM_DECIMAL_PLACES);
+        Serial.print(F(">Gyro_Z:")); Serial.println(sample.gz, STREAM_DECIMAL_PLACES);
+    #endif
+    }
 
 void SerialStreamer::maybePrintStats(uint32_t& samplesSinceLastStat, uint32_t i2cErrors)
 {
