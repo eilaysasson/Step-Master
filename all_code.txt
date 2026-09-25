@@ -353,7 +353,7 @@ MotionSensor* getSensor()
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\sensors\MotionAlgorithms.cpp =====
 
-#include "algorithem/MotionAlgorithms.h"
+#include "sensors/MotionSensor.h"
 #include <cmath>
 
 float calculateAccelerationMagnitude(MotionData data)
@@ -384,7 +384,7 @@ void processMotion(MotionData data)
 
 #include "streaming/DebugCli.h"
 
-#include "BuildFlags.h"
+#include "params/BuildFlags.h"
 #include "hal/SampleTimer.h"
 #include "streaming/SerialStreamer.h"
 
@@ -537,8 +537,8 @@ void DebugCli::printRate() const
 
 #include "streaming/SerialStreamer.h"
 
-#include "AlgoParams.hpp"
-#include "BuildFlags.h"
+#include "params/AlgoParams.hpp"
+#include "params/BuildFlags.h"
 #include "hal/SampleTimer.h"
 
 #include <Arduino.h>
@@ -560,28 +560,28 @@ bool SerialStreamer::enabled() const
 }
 
 void SerialStreamer::streamSample(const RawSample& sample)
+{
+#if ENABLE_STREAMING
+    if (!enabled_)
     {
-    #if ENABLE_STREAMING
-        if (!enabled_)
-        {
-            return;
-        }
-
-        // Teleplot Format: >VariableName:Value
-        // Stream accelerometer axes
-        Serial.print(F(">Accel_X:"));
-        Serial.println(sample.ax, STREAM_DECIMAL_PLACES);
-        Serial.print(F(">Accel_Y:"));
-        Serial.println(sample.ay, STREAM_DECIMAL_PLACES);
-        Serial.print(F(">Accel_Z:"));
-        Serial.println(sample.az, STREAM_DECIMAL_PLACES);
-
-        // Stream gyroscope axes
-        Serial.print(F(">Gyro_X:")); Serial.println(sample.gx, STREAM_DECIMAL_PLACES);
-        Serial.print(F(">Gyro_Y:")); Serial.println(sample.gy, STREAM_DECIMAL_PLACES);
-        Serial.print(F(">Gyro_Z:")); Serial.println(sample.gz, STREAM_DECIMAL_PLACES);
-    #endif
+        return;
     }
+
+    // Teleplot Format: >VariableName:Value
+    // Stream accelerometer axes
+    Serial.print(F(">Accel_X:"));
+    Serial.println(sample.ax, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Accel_Y:"));
+    Serial.println(sample.ay, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Accel_Z:"));
+    Serial.println(sample.az, STREAM_DECIMAL_PLACES);
+
+    // Stream gyroscope axes
+    Serial.print(F(">Gyro_X:")); Serial.println(sample.gx, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Gyro_Y:")); Serial.println(sample.gy, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Gyro_Z:")); Serial.println(sample.gz, STREAM_DECIMAL_PLACES);
+#endif
+}
 
 void SerialStreamer::maybePrintStats(uint32_t& samplesSinceLastStat, uint32_t i2cErrors)
 {
@@ -917,7 +917,7 @@ private:
 #ifndef STAIR_MOTION_HPP
 #define STAIR_MOTION_HPP
 
-#include "BaseMotion.hpp"
+#include "detectors/BaseMotion.hpp"
 #include "params/AlgoParams.hpp"
 #include "utils/PeakDetector.hpp"
 #include <cmath>
@@ -931,11 +931,11 @@ public:
                     shortTimeEnergyBuffer_(0.0f), consecutiveStairFrames_(0), stepRefractoryEndMs_(0) {}
 
 protected:
-    bool preConditionMet(float rawMag, float smoothMag, float pitchAngle, uint32_t timestampMs, const SlidingWindow& window) override {
-        float frameEnergy = (smoothMag - window.getMean()) * (smoothMag - window.getMean());
+    bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
+        float frameEnergy = (features.smoothMag - window.getMean()) * (features.smoothMag - window.getMean());
         shortTimeEnergyBuffer_ = (0.8f * shortTimeEnergyBuffer_) + (0.2f * frameEnergy);
 
-        if (shortTimeEnergyBuffer_ > AlgoParams::STAIR_ENERGY_THRESHOLD && std::fabs(pitchAngle) > AlgoParams::STAIR_PITCH_THRESHOLD) {
+        if (shortTimeEnergyBuffer_ > AlgoParams::STAIR_ENERGY_THRESHOLD && std::fabs(features.pitchAngle) > AlgoParams::STAIR_PITCH_THRESHOLD) {
             if (stairState_ == StairFsmState::FLAT_GAIT) {
                 consecutiveStairFrames_++;
                 if (consecutiveStairFrames_ >= AlgoParams::STAIR_CONSECUTIVE_FRAMES) {
@@ -948,16 +948,16 @@ protected:
             consecutiveStairFrames_ = 0;
         }
 
-        return (stairState_ == StairFsmState::STAIR_CLIMBING) && (timestampMs >= stepRefractoryEndMs_);
+        return (stairState_ == StairFsmState::STAIR_CLIMBING) && (features.timestampMs >= stepRefractoryEndMs_);
     }
 
-    bool detectSpecificMotion(float rawMag, float smoothMag, float pitchAngle, uint32_t timestampMs, const SlidingWindow& window) override {
+    bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
         float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
-        float clampedThreshold = std::clamp(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MIN_G, AlgoParams::STEP_THRESHOLD_MAX_G);
+        float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
 
         float peakValue = 0.0f;
-        if (peakDetector_.isPeak(smoothMag, peakValue) && peakValue > clampedThreshold) {
-            stepRefractoryEndMs_ = timestampMs + AlgoParams::STEP_REFRACTORY_MS;
+        if (peakDetector_.update(features.smoothMag, peakValue) && peakValue > clampedThreshold) {
+            stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
             return true;
         }
         return false;
@@ -994,7 +994,7 @@ protected:
 
     bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
         float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
-        float clampedThreshold = std::clamp(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MIN_G, AlgoParams::STEP_THRESHOLD_MAX_G);
+        float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
 
         float peakValue = 0.0f;
         if (peakDetector_.update(features.smoothMag, peakValue) && peakValue > clampedThreshold) {
@@ -1254,182 +1254,82 @@ public:
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\streaming\DebugCli.h =====
 
-#include "streaming/DebugCli.h"
-#include "params/BuildFlags.h"
-#include "hal/SampleTimer.h"
-#include "streaming/SerialStreamer.h"
-#include <Arduino.h>
-#include <cstring>
+#ifndef DEBUG_CLI_H
+#define DEBUG_CLI_H
 
-void DebugCli::begin(SerialStreamer* streamer)
-{
-    streamer_ = streamer;
-    lineLength_ = 0;
-    rateWindowStartMs_ = millis();
-    rateWindowSamples_ = 0;
-}
+#include <cstddef>
+#include <cstdint>
 
-void DebugCli::setSampleCount(uint32_t count)
-{
-    sampleCount_ = count;
-}
+class SerialStreamer;
 
-void DebugCli::setI2cErrors(uint32_t errors)
+/// Simple command-line interface for debugging and runtime control.
+class DebugCli
 {
-    i2cErrors_ = errors;
-}
+public:
+    /// Attach the CLI to a serial streamer for runtime commands.
+    void begin(SerialStreamer* streamer);
 
-void DebugCli::poll()
-{
-#if !ENABLE_DEBUG_CLI
-    return;
+    /// Poll the serial port for commands and process them.
+    void poll();
+
+    /// Update the sample count shown in statistics output.
+    void setSampleCount(uint32_t count);
+
+    /// Update the I2C error count shown in statistics output.
+    void setI2cErrors(uint32_t errors);
+
+private:
+    void processLine(const char* line);
+    void printHelp() const;
+    void printStats() const;
+    void printRate() const;
+
+    SerialStreamer* streamer_ = nullptr;
+    char lineBuffer_[64];
+    std::size_t lineLength_ = 0;
+
+    uint32_t sampleCount_ = 0;
+    uint32_t i2cErrors_ = 0;
+    uint32_t rateWindowStartMs_ = 0;
+    uint32_t rateWindowSamples_ = 0;
+};
+
 #endif
-
-    while (Serial.available() > 0)
-    {
-        const char c = static_cast<char>(Serial.read());
-        if (c == '\r') continue;
-
-        if (c == '\n')
-        {
-            lineBuffer_[lineLength_] = '\0';
-            if (lineLength_ > 0) processLine(lineBuffer_);
-            lineLength_ = 0;
-            continue;
-        }
-
-        if (lineLength_ + 1 < sizeof(lineBuffer_))
-        {
-            lineBuffer_[lineLength_++] = c;
-        }
-    }
-}
-
-void DebugCli::processLine(const char* line)
-{
-    if (line[0] == '#') ++line;
-
-    if (strcmp(line, "help") == 0) printHelp();
-    else if (strcmp(line, "stats") == 0) printStats();
-    else if (strcmp(line, "reset") == 0)
-    {
-        g_sampleDrops = 0;
-        g_expectedTicks = 0;
-        sampleCount_ = 0;
-        rateWindowStartMs_ = millis();
-        rateWindowSamples_ = 0;
-        Serial.println(F("OK counters reset"));
-    }
-    else if (strcmp(line, "stream on") == 0)
-    {
-        if (streamer_ != nullptr) streamer_->setEnabled(true);
-        Serial.println(F("OK stream on"));
-    }
-    else if (strcmp(line, "stream off") == 0)
-    {
-        if (streamer_ != nullptr) streamer_->setEnabled(false);
-        Serial.println(F("OK stream off"));
-    }
-    else if (strcmp(line, "rate") == 0) printRate();
-    else Serial.println(F("ERR unknown command (try help)"));
-}
-
-void DebugCli::printHelp() const
-{
-    Serial.println(F("Commands:"));
-    Serial.println(F("  help        - list commands"));
-    Serial.println(F("  stats       - print counters"));
-    Serial.println(F("  reset       - reset drop/sample counters"));
-    Serial.println(F("  stream on   - enable CSV output"));
-    Serial.println(F("  stream off  - disable CSV output"));
-    Serial.println(F("  rate        - print measured sample rate"));
-}
-
-void DebugCli::printStats() const
-{
-    Serial.print(F("STATS samples=")); Serial.print(sampleCount_);
-    Serial.print(F(" drops=")); Serial.print(g_sampleDrops);
-    Serial.print(F(" expected_ticks=")); Serial.print(g_expectedTicks);
-    Serial.print(F(" i2c_errors=")); Serial.println(i2cErrors_);
-}
-
-void DebugCli::printRate() const
-{
-    const uint32_t nowMs = millis();
-    const uint32_t elapsedMs = nowMs - rateWindowStartMs_;
-    if (elapsedMs == 0)
-    {
-        Serial.println(F("RATE unavailable"));
-        return;
-    }
-
-    const float rateHz = (static_cast<float>(rateWindowSamples_) * 1000.0f) / static_cast<float>(elapsedMs);
-    Serial.print(F("RATE hz=")); Serial.println(rateHz, 2);
-}
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\streaming\SerialStreamer.h =====
 
-#include "streaming/SerialStreamer.h"
-#include "params/AlgoParams.hpp"
-#include "params/BuildFlags.h"
-#include "hal/SampleTimer.h"
-#include <Arduino.h>
+#ifndef SERIAL_STREAMER_H
+#define SERIAL_STREAMER_H
 
-void SerialStreamer::begin()
+#include "buffers/RingBuffer.hpp"
+
+#include <cstdint>
+
+/// Handles sending raw sample data and periodic statistics over serial.
+class SerialStreamer
 {
-    enabled_ = true;
-    lastStatMs_ = millis();
-}
+public:
+    /// Enable streaming and set initial internal timestamp.
+    void begin();
 
-void SerialStreamer::setEnabled(bool enabled)
-{
-    enabled_ = enabled;
-}
+    /// Enable or disable serial output at runtime.
+    void setEnabled(bool enabled);
 
-bool SerialStreamer::enabled() const
-{
-    return enabled_;
-}
+    /// Query whether streaming is currently enabled.
+    bool enabled() const;
 
-void SerialStreamer::streamSample(const RawSample& sample)
-{
-#if ENABLE_STREAMING
-    if (!enabled_) return;
+    /// Send one raw sample as CSV over the serial interface.
+    void streamSample(const RawSample& sample);
 
-    Serial.print(F(">Accel_X:")); Serial.println(sample.ax, STREAM_DECIMAL_PLACES);
-    Serial.print(F(">Accel_Y:")); Serial.println(sample.ay, STREAM_DECIMAL_PLACES);
-    Serial.print(F(">Accel_Z:")); Serial.println(sample.az, STREAM_DECIMAL_PLACES);
+    /// Print periodic statistics if the stats interval has elapsed.
+    void maybePrintStats(uint32_t& samplesSinceLastStat, uint32_t i2cErrors);
 
-    Serial.print(F(">Gyro_X:")); Serial.println(sample.gx, STREAM_DECIMAL_PLACES);
-    Serial.print(F(">Gyro_Y:")); Serial.println(sample.gy, STREAM_DECIMAL_PLACES);
-    Serial.print(F(">Gyro_Z:")); Serial.println(sample.gz, STREAM_DECIMAL_PLACES);
+private:
+    bool enabled_ = true;
+    uint32_t lastStatMs_ = 0;
+};
+
 #endif
-}
-
-void SerialStreamer::maybePrintStats(uint32_t& samplesSinceLastStat, uint32_t i2cErrors)
-{
-    const uint32_t nowMs = millis();
-    if ((nowMs - lastStatMs_) < AlgoParams::STAT_INTERVAL_MS) return;
-
-    lastStatMs_ = nowMs;
-
-    const float elapsedSec = AlgoParams::STAT_INTERVAL_MS / 1000.0f;
-    const float rateHz = elapsedSec > 0.0f ? static_cast<float>(samplesSinceLastStat) / elapsedSec : 0.0f;
-
-    Serial.print(F("STAT,samples=")); Serial.print(samplesSinceLastStat);
-    Serial.print(F(",drops="));
-
-#if ENABLE_SAMPLE_DROP_COUNTER
-    Serial.print(g_sampleDrops);
-#else
-    Serial.print(F("0"));
-#endif
-
-    Serial.print(F(",i2c_errors=")); Serial.print(i2cErrors);
-    Serial.print(F(",rate_hz=")); Serial.println(rateHz, 1);
-
-    samplesSinceLastStat = 0;
-}
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\utils\PeakDetector.hpp =====
 
@@ -1604,10 +1504,10 @@ inline void stabilizeWindow(MotionClassifier& classifier, uint32_t& clockMs) {
 
 #include <Arduino.h>
 #include <unity.h>
-#include "algorithm/MotionClassifier.h"
+#include "algorithem/MotionClassifier.h"
 #include "filter/EmaFilter.hpp"
-#include "JumpMotion.hpp"
-#include "StepMotion.hpp"
+#include "detectors/JumpMotion.hpp"
+#include "detectors/StepMotion.hpp"
 
 // ----------------------------------------------------------------------------------------------------
 // Helper Function: Stabilize Window
@@ -1845,10 +1745,10 @@ void loop() {}
 
 #include <Arduino.h>
 #include <unity.h>
-#include "MotionClassifier.h"
-#include "EmaFilter.hpp"
-#include "StairMotion.hpp"
-#include "StepMotion.hpp"
+#include "algorithem/MotionClassifier.h"
+#include "filter/EmaFilter.hpp"
+#include "detectors/StairMotion.hpp"
+#include "detectors/StepMotion.hpp"
 
 // ----------------------------------------------------------------------------------------------------
 // Helper Function: Stabilize Window
@@ -1958,10 +1858,10 @@ void loop() {}
 
 #include <Arduino.h>
 #include <unity.h>
-#include "MotionClassifier.h"
-#include "EmaFilter.hpp"
-#include "StepMotion.hpp"
-#include "JumpMotion.hpp"
+#include "algorithem/MotionClassifier.h"
+#include "filter/EmaFilter.hpp"
+#include "detectors/StepMotion.hpp"
+#include "detectors/JumpMotion.hpp"
 
 // ----------------------------------------------------------------------------------------------------
 // Helper Function: Stabilize Window
@@ -2113,10 +2013,10 @@ void loop() {}
 
 #include <Arduino.h>
 #include <unity.h>
-#include "MotionClassifier.h"
-#include "EmaFilter.hpp"
-#include "StepMotion.hpp"
-#include "JumpMotion.hpp"
+#include "algorithem/MotionClassifier.h"
+#include "filter/EmaFilter.hpp"
+#include "detectors/StepMotion.hpp"
+#include "detectors/JumpMotion.hpp"
 
 // ----------------------------------------------------------------------------------------------------
 // Helper Function: Stabilize Window
