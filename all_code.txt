@@ -1,0 +1,2302 @@
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\main.cpp =====
+
+// ========================================================================================================
+// File: main.cpp
+// Purpose: Production composition root. Wires hardware sensors, ISR timers, ring buffers, streaming, 
+// and the DSP classification engine into a non-blocking 100Hz pipeline.
+// ========================================================================================================
+
+#include <Arduino.h>
+
+// Use the correct PlatformIO unit testing flag to prevent multiple definitions
+#ifndef PIO_UNIT_TESTING
+
+#include "params/AlgoParams.hpp"
+#include "config/HardwareConfig.hpp"
+#include "params/BuildFlags.h"
+
+#include "hal/SampleTimer.h"
+#include "buffers/RingBuffer.hpp"
+#include "streaming/SerialStreamer.h"
+#include "streaming/DebugCli.h"
+
+#include "algorithem/MotionClassifier.h"
+#include "filter/EmaFilter.hpp"
+#include "detectors/StepMotion.hpp"
+#include "detectors/JumpMotion.hpp"
+#include "detectors/StairMotion.hpp"
+
+#if USE_MOCK_SENSOR
+#include "sensors/MockSensor.h"
+MotionSensor* sensor = getSensor();
+#else
+#include "drivers/Mpu6050Sensor.h"
+Mpu6050Sensor hardwareSensor;
+MotionSensor* sensor = &hardwareSensor;
+#endif
+
+SampleTimer sampleTimer;
+SampleRingBuffer<AlgoParams::RING_BUFFER_CAPACITY> ringBuffer;
+SerialStreamer streamer;
+DebugCli cli;
+
+EmaFilter mainFilter(0.53f);
+MotionClassifier classifier(&mainFilter);
+StepMotion stepDetector;
+JumpMotion jumpDetector;
+StairMotion stairDetector;
+
+uint32_t totalSamplesProcessed = 0;
+uint32_t ledTurnOffTimestampMs = 0;
+bool isLedActive = false;
+
+void setup() {
+    Serial.begin(AlgoParams::SERIAL_BAUD);
+    delay(2000);
+
+    Serial.println("=================================================");
+    Serial.println("StepMaster Ankle Motion Tracker - Initializing...");
+    Serial.println("=================================================");
+
+    pinMode(HardwareConfig::LED_PIN, OUTPUT);
+    digitalWrite(HardwareConfig::LED_PIN, HardwareConfig::LED_OFF);
+
+    streamer.begin();
+    cli.begin(&streamer);
+
+    classifier.addDetector(&jumpDetector);
+    classifier.addDetector(&stairDetector);
+    classifier.addDetector(&stepDetector);
+
+    if (!sensor->begin()) {
+        Serial.println("[ERROR] Sensor initialization failed! Check I2C wiring.");
+        while (true) { delay(100); }
+    }
+    
+    Serial.println("[INFO] Sensor initialized successfully.");
+
+    if (!sampleTimer.begin(AlgoParams::SAMPLE_INTERVAL_US)) {
+        Serial.println("[ERROR] Failed to start hardware timer.");
+        while (true) { delay(100); }
+    }
+
+    Serial.println("[INFO] Timer running at 100Hz. Entering main monitoring loop...");
+}
+
+void loop() {
+    cli.poll();
+
+    // Consume the timer tick securely to prevent ISR race conditions
+    if (sampleTimer.consumeSample()) {
+        MotionData rawData;
+        if (sensor->read(rawData)) {
+            RawSample rSample;
+            rSample.sequence = rawData.sequence;
+            rSample.timestampMs = rawData.timestampMs;
+            rSample.ax = rawData.accelX;
+            rSample.ay = rawData.accelY;
+            rSample.az = rawData.accelZ;
+            rSample.gx = rawData.gyroX;
+            rSample.gy = rawData.gyroY;
+            rSample.gz = rawData.gyroZ;
+
+            ringBuffer.push(rSample);
+        }
+    }
+
+    while (!ringBuffer.empty()) {
+        RawSample currentSample;
+        ringBuffer.pop(currentSample);
+
+        streamer.streamSample(currentSample);
+
+        MotionData mData;
+        mData.timestampMs = currentSample.timestampMs;
+        mData.sequence = currentSample.sequence;
+        mData.accelX = currentSample.ax;
+        mData.accelY = currentSample.ay;
+        mData.accelZ = currentSample.az;
+        mData.gyroX = currentSample.gx;
+        mData.gyroY = currentSample.gy;
+        mData.gyroZ = currentSample.gz;
+
+        MotionState currentState = classifier.update(mData);
+
+        if (currentState != MotionState::IDLE && currentState != MotionState::NOISE) {
+            digitalWrite(HardwareConfig::LED_PIN, HardwareConfig::LED_ON);
+            ledTurnOffTimestampMs = millis() + AlgoParams::LED_PULSE_DURATION_MS;
+            isLedActive = true;
+
+            Serial.print("[EVENT] State: ");
+            Serial.print(static_cast<int>(currentState));
+            Serial.print(" | Steps: "); Serial.print(stepDetector.getCount());
+            Serial.print(" | Jumps: "); Serial.print(jumpDetector.getCount());
+            Serial.print(" | Stairs: "); Serial.println(stairDetector.getCount());
+        }
+
+        totalSamplesProcessed++;
+    }
+
+    if (isLedActive && millis() >= ledTurnOffTimestampMs) {
+        digitalWrite(HardwareConfig::LED_PIN, HardwareConfig::LED_OFF);
+        isLedActive = false;
+    }
+
+    uint32_t currentI2cErrors = sensor->i2cErrorCount();
+    cli.setSampleCount(totalSamplesProcessed);
+    cli.setI2cErrors(currentI2cErrors);
+    streamer.maybePrintStats(totalSamplesProcessed, currentI2cErrors);
+}
+
+#endif // PIO_UNIT_TESTING
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\algorithem\MotionClassifier.cpp =====
+
+#include "algorithem/MotionClassifier.h"
+#include "params/AlgoParams.hpp"
+#include <cmath>
+
+MotionClassifier::MotionClassifier(IFilter* filter) 
+    : magnitudeFilter_(filter), detectorCount_(0), currentPitch_(0.0f) {
+}
+
+void MotionClassifier::addDetector(BaseMotion* detector) {
+    if (detectorCount_ < MAX_DETECTORS) {
+        detectors_[detectorCount_] = detector;
+        detectorCount_++;
+    }
+}
+
+MotionState MotionClassifier::update(const MotionData& rawData) {
+    float rawMag = std::sqrt((rawData.accelX * rawData.accelX) + 
+                             (rawData.accelY * rawData.accelY) + 
+                             (rawData.accelZ * rawData.accelZ));
+
+    float smoothMag = magnitudeFilter_->process(rawMag);
+
+    // Calculate kinematic pitch using a Complementary Filter (96% Gyro, 4% Accel)
+    float dtSeconds = AlgoParams::SAMPLE_INTERVAL_US / 1000000.0f;
+    float accelPitch = std::atan2(rawData.accelX, std::sqrt((rawData.accelY * rawData.accelY) + (rawData.accelZ * rawData.accelZ))) * 57.2958f;
+    currentPitch_ = 0.96f * (currentPitch_ + rawData.gyroY * dtSeconds) + 0.04f * accelPitch;
+
+    slidingWindow_.push(smoothMag);
+
+    MotionFeatures features = {rawMag, smoothMag, currentPitch_, rawData.timestampMs};
+
+    for (uint8_t i = 0; i < detectorCount_; i++) {
+        MotionState evaluatedState = detectors_[i]->evaluate(features, slidingWindow_);
+        if (evaluatedState != MotionState::IDLE && evaluatedState != MotionState::NOISE) {
+            return evaluatedState;
+        }
+    }
+
+    return MotionState::IDLE;
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\drivers\Mpu6050Sensor.cpp =====
+
+#include "drivers/Mpu6050Sensor.h"
+#include "params/AlgoParams.hpp"
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+
+#if !USE_MOCK_SENSOR
+
+namespace {
+    Adafruit_MPU6050 mpu;
+}
+
+bool Mpu6050Sensor::begin() {
+    Wire.begin();
+    
+    ready_ = mpu.begin(AlgoParams::IMU_I2C_ADDRESS, &Wire, 0);
+    
+    if (!ready_) {
+        ++i2cErrors_;
+        return false;
+    }
+
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+    return true;
+}
+
+bool Mpu6050Sensor::read(MotionData& out) {
+    if (!ready_) {
+        ++i2cErrors_;
+        return false;
+    }
+
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+
+    out.accelX = a.acceleration.x / 9.80665f;
+    out.accelY = a.acceleration.y / 9.80665f;
+    out.accelZ = a.acceleration.z / 9.80665f;
+    
+    out.gyroX = g.gyro.x * 57.2958f;
+    out.gyroY = g.gyro.y * 57.2958f;
+    out.gyroZ = g.gyro.z * 57.2958f;
+    
+    return true;
+}
+
+uint32_t Mpu6050Sensor::i2cErrorCount() const {
+    return i2cErrors_;
+}
+
+#endif
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\hal\SampleTimer.cpp =====
+
+#include "hal/SampleTimer.h"
+#include <Arduino.h>
+#include <NRF52_MBED_TimerInterrupt.h>
+
+volatile bool g_sampleDue = false;
+volatile uint32_t g_expectedTicks = 0;
+volatile uint32_t g_sampleDrops = 0;
+
+namespace {
+    NRF52_MBED_Timer sampleTimer(NRF_TIMER_3);
+
+    void onSampleTick() {
+        if (g_sampleDue) {
+            g_sampleDrops++;
+        }
+        g_sampleDue = true;
+        g_expectedTicks++;
+    }
+}
+
+bool SampleTimer::begin(uint32_t intervalUs) {
+    if (started_) return true;
+    
+    g_sampleDue = false;
+    g_expectedTicks = 0;
+    g_sampleDrops = 0;
+
+    started_ = sampleTimer.attachInterruptInterval(intervalUs, onSampleTick);
+    return started_;
+}
+
+void SampleTimer::end() {
+    if (!started_) return;
+    sampleTimer.detachInterrupt();
+    started_ = false;
+}
+
+bool SampleTimer::consumeSample() {
+    // Atomic read-and-clear to prevent race conditions with the hardware timer ISR.
+    noInterrupts();
+    if (!g_sampleDue) {
+        interrupts();
+        return false;
+    }
+    g_sampleDue = false;
+    interrupts();
+    return true;
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\sensors\MockSensor.cpp =====
+
+#include "sensors/MockSensor.h"
+#include <Arduino.h>
+#include <cmath>
+
+namespace
+{
+class MockSensorImpl : public MotionSensor
+{
+public:
+    bool begin() override
+    {
+        return true;
+    }
+
+    bool read(MotionData& out) override
+    {
+        const float t = millis() / 1000.0f;
+        const float pi = 3.14159265f;
+
+        out.accelX = 0.4f * sinf(2.0f * pi * 0.7f * t);
+        out.accelY = 0.3f * sinf(2.0f * pi * 1.1f * t);
+        out.accelZ = 1.0f + 0.1f * sinf(2.0f * pi * 0.5f * t);
+
+        out.gyroX = 15.0f * sinf(2.0f * pi * 0.6f * t);
+        out.gyroY = 10.0f * sinf(2.0f * pi * 0.9f * t);
+        out.gyroZ = 5.0f * sinf(2.0f * pi * 0.4f * t);
+
+        out.sequence = 0;
+        out.timestampMs = millis();
+
+        return true;
+    }
+
+    uint32_t i2cErrorCount() const override
+    {
+        return 0;
+    }
+};
+
+MockSensorImpl mockSensor;
+} // namespace
+
+MotionSensor* getSensor()
+{
+    return &mockSensor;
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\sensors\MotionAlgorithms.cpp =====
+
+#include "algorithem/MotionAlgorithms.h"
+#include <cmath>
+
+float calculateAccelerationMagnitude(MotionData data)
+{
+    return std::sqrt(data.accelX * data.accelX +
+                     data.accelY * data.accelY +
+                     data.accelZ * data.accelZ);
+}
+
+bool detectMovement(MotionData data)
+{
+    // Compute the vector magnitude of acceleration.
+    float mag = calculateAccelerationMagnitude(data);
+
+    // Movement detection threshold in g units.
+    constexpr float STEP_THRESHOLD_G = 1.5f;
+
+    return (mag > STEP_THRESHOLD_G);
+}
+
+void processMotion(MotionData data)
+{
+    // Placeholder for future motion processing logic.
+    (void)data;
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\streaming\DebugCli.cpp =====
+
+#include "streaming/DebugCli.h"
+
+#include "BuildFlags.h"
+#include "hal/SampleTimer.h"
+#include "streaming/SerialStreamer.h"
+
+#include <Arduino.h>
+#include <cstring>
+
+void DebugCli::begin(SerialStreamer* streamer)
+{
+    streamer_ = streamer;
+    lineLength_ = 0;
+    rateWindowStartMs_ = millis();
+    rateWindowSamples_ = 0;
+}
+
+void DebugCli::setSampleCount(uint32_t count)
+{
+    sampleCount_ = count;
+}
+
+void DebugCli::setI2cErrors(uint32_t errors)
+{
+    i2cErrors_ = errors;
+}
+
+void DebugCli::poll()
+{
+#if !ENABLE_DEBUG_CLI
+    return;
+#endif
+
+    // Consume all available serial characters and build command lines.
+    while (Serial.available() > 0)
+    {
+        const char c = static_cast<char>(Serial.read());
+        if (c == '\r')
+        {
+            continue;
+        }
+
+        if (c == '\n')
+        {
+            lineBuffer_[lineLength_] = '\0';
+            if (lineLength_ > 0)
+            {
+                processLine(lineBuffer_);
+            }
+            lineLength_ = 0;
+            continue;
+        }
+
+        if (lineLength_ + 1 < sizeof(lineBuffer_))
+        {
+            lineBuffer_[lineLength_++] = c;
+        }
+    }
+}
+
+void DebugCli::processLine(const char* line)
+{
+    if (line[0] == '#')
+    {
+        // Allow comments or commands prefixed with '#'.
+        ++line;
+    }
+
+    if (strcmp(line, "help") == 0)
+    {
+        printHelp();
+    }
+    else if (strcmp(line, "stats") == 0)
+    {
+        printStats();
+    }
+    else if (strcmp(line, "reset") == 0)
+    {
+        // Reset runtime counters used for diagnostics.
+        g_sampleDrops = 0;
+        g_expectedTicks = 0;
+        sampleCount_ = 0;
+        rateWindowStartMs_ = millis();
+        rateWindowSamples_ = 0;
+        Serial.println(F("OK counters reset"));
+    }
+    else if (strcmp(line, "stream on") == 0)
+    {
+        if (streamer_ != nullptr)
+        {
+            streamer_->setEnabled(true);
+        }
+        Serial.println(F("OK stream on"));
+    }
+    else if (strcmp(line, "stream off") == 0)
+    {
+        if (streamer_ != nullptr)
+        {
+            streamer_->setEnabled(false);
+        }
+        Serial.println(F("OK stream off"));
+    }
+    else if (strcmp(line, "rate") == 0)
+    {
+        printRate();
+    }
+    else
+    {
+        Serial.println(F("ERR unknown command (try help)"));
+    }
+}
+
+void DebugCli::printHelp() const
+{
+    Serial.println(F("Commands:"));
+    Serial.println(F("  help        - list commands"));
+    Serial.println(F("  stats       - print counters"));
+    Serial.println(F("  reset       - reset drop/sample counters"));
+    Serial.println(F("  stream on   - enable CSV output"));
+    Serial.println(F("  stream off  - disable CSV output"));
+    Serial.println(F("  rate        - print measured sample rate"));
+}
+
+void DebugCli::printStats() const
+{
+    Serial.print(F("STATS samples="));
+    Serial.print(sampleCount_);
+    Serial.print(F(" drops="));
+    Serial.print(g_sampleDrops);
+    Serial.print(F(" expected_ticks="));
+    Serial.print(g_expectedTicks);
+    Serial.print(F(" i2c_errors="));
+    Serial.println(i2cErrors_);
+}
+
+void DebugCli::printRate() const
+{
+    const uint32_t nowMs = millis();
+    const uint32_t elapsedMs = nowMs - rateWindowStartMs_;
+    if (elapsedMs == 0)
+    {
+        Serial.println(F("RATE unavailable"));
+        return;
+    }
+
+    const float rateHz = (static_cast<float>(rateWindowSamples_) * 1000.0f)
+        / static_cast<float>(elapsedMs);
+    Serial.print(F("RATE hz="));
+    Serial.println(rateHz, 2);
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\streaming\SerialStreamer.cpp =====
+
+#include "streaming/SerialStreamer.h"
+
+#include "AlgoParams.hpp"
+#include "BuildFlags.h"
+#include "hal/SampleTimer.h"
+
+#include <Arduino.h>
+
+void SerialStreamer::begin()
+{
+    enabled_ = true;
+    lastStatMs_ = millis();
+}
+
+void SerialStreamer::setEnabled(bool enabled)
+{
+    enabled_ = enabled;
+}
+
+bool SerialStreamer::enabled() const
+{
+    return enabled_;
+}
+
+void SerialStreamer::streamSample(const RawSample& sample)
+    {
+    #if ENABLE_STREAMING
+        if (!enabled_)
+        {
+            return;
+        }
+
+        // Teleplot Format: >VariableName:Value
+        // Stream accelerometer axes
+        Serial.print(F(">Accel_X:"));
+        Serial.println(sample.ax, STREAM_DECIMAL_PLACES);
+        Serial.print(F(">Accel_Y:"));
+        Serial.println(sample.ay, STREAM_DECIMAL_PLACES);
+        Serial.print(F(">Accel_Z:"));
+        Serial.println(sample.az, STREAM_DECIMAL_PLACES);
+
+        // Stream gyroscope axes
+        Serial.print(F(">Gyro_X:")); Serial.println(sample.gx, STREAM_DECIMAL_PLACES);
+        Serial.print(F(">Gyro_Y:")); Serial.println(sample.gy, STREAM_DECIMAL_PLACES);
+        Serial.print(F(">Gyro_Z:")); Serial.println(sample.gz, STREAM_DECIMAL_PLACES);
+    #endif
+    }
+
+void SerialStreamer::maybePrintStats(uint32_t& samplesSinceLastStat, uint32_t i2cErrors)
+{
+    const uint32_t nowMs = millis();
+    if ((nowMs - lastStatMs_) < AlgoParams::STAT_INTERVAL_MS)
+    {
+        return;
+    }
+
+    lastStatMs_ = nowMs;
+
+    const float elapsedSec = AlgoParams::STAT_INTERVAL_MS / 1000.0f;
+    const float rateHz = elapsedSec > 0.0f
+        ? static_cast<float>(samplesSinceLastStat) / elapsedSec
+        : 0.0f;
+
+    Serial.print(F("STAT,samples="));
+    Serial.print(samplesSinceLastStat);
+    Serial.print(F(",drops="));
+#if ENABLE_SAMPLE_DROP_COUNTER
+    Serial.print(g_sampleDrops);
+#else
+    Serial.print(F("0"));
+#endif
+    Serial.print(F(",i2c_errors="));
+    Serial.print(i2cErrors);
+    Serial.print(F(",rate_hz="));
+    Serial.println(rateHz, 1);
+
+    // Reset the sample counter after emitting stats.
+    samplesSinceLastStat = 0;
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\utils\SlidingWindow.cpp =====
+
+#include "utils/SlidingWindow.hpp"
+#include <cmath>
+#include <algorithm>
+
+SlidingWindow::SlidingWindow() {
+    clear();
+}
+
+void SlidingWindow::push(float value) {
+    float oldVal = buffer_[head_];
+    buffer_[head_] = value;
+    
+    head_++;
+    if (head_ >= AlgoParams::SLIDING_WINDOW_SIZE) {
+        head_ = 0;
+    }
+    
+    if (count_ < AlgoParams::SLIDING_WINDOW_SIZE) {
+        count_++;
+    }
+    
+    sum_ = sum_ + value - oldVal;
+    sumSq_ = sumSq_ + (value * value) - (oldVal * oldVal);
+}
+
+float SlidingWindow::getMean() const {
+    if (count_ == 0) return 0.0f;
+    return sum_ / static_cast<float>(count_);
+}
+
+float SlidingWindow::getStdDev() const {
+    if (count_ == 0) return 0.0f;
+    
+    float mean = getMean();
+    float variance = (sumSq_ / static_cast<float>(count_)) - (mean * mean);
+    
+    variance = std::max(0.0f, variance);
+    return std::sqrt(variance);
+}
+
+bool SlidingWindow::isFull() const {
+    return count_ == AlgoParams::SLIDING_WINDOW_SIZE;
+}
+
+void SlidingWindow::clear() {
+    for (std::size_t i = 0; i < AlgoParams::SLIDING_WINDOW_SIZE; i++) {
+        buffer_[i] = 0.0f;
+    }
+    head_ = 0;
+    count_ = 0;
+    sum_ = 0.0f;
+    sumSq_ = 0.0f;
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\algorithem\MotionClassifier.h =====
+
+#ifndef MOTION_CLASSIFIER_H
+#define MOTION_CLASSIFIER_H
+
+#include <cstdint>
+#include "sensors/MotionSensor.h"
+#include "params/MotionState.h"
+#include "sensors/MotionFeatures.h"
+#include "filter/IFilter.hpp"
+#include "utils/SlidingWindow.hpp"
+#include "detectors/BaseMotion.hpp"
+
+class MotionClassifier {
+public:
+    MotionClassifier(IFilter* filter);
+    void addDetector(BaseMotion* detector);
+    MotionState update(const MotionData& rawData);
+
+private:
+    IFilter* magnitudeFilter_;
+    SlidingWindow slidingWindow_;
+    
+    static const uint8_t MAX_DETECTORS = 5;
+    BaseMotion* detectors_[MAX_DETECTORS];
+    uint8_t detectorCount_;
+    
+    float currentPitch_;
+};
+
+#endif // MOTION_CLASSIFIER_H
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\buffers\RingBuffer.hpp =====
+
+#ifndef RING_BUFFER_HPP
+#define RING_BUFFER_HPP
+
+#include <cstddef>
+#include <cstdint>
+
+/// Raw sensor sample structure streamed from the IMU.
+struct RawSample
+{
+    uint32_t sequence;
+    uint32_t timestampMs;
+    float ax;
+    float ay;
+    float az;
+    float gx;
+    float gy;
+    float gz;
+};
+
+template <std::size_t Capacity>
+class SampleRingBuffer
+{
+public:
+    /// Reset the ring buffer to an empty state.
+    void clear()
+    {
+        head_ = 0;
+        tail_ = 0;
+        count_ = 0;
+    }
+
+    /// Add a raw sample to the buffer if there is room.
+    /// Returns false when the buffer is full.
+    bool push(const RawSample& sample)
+    {
+        if (count_ >= Capacity)
+        {
+            return false;
+        }
+
+        buffer_[head_] = sample;
+        head_ = (head_ + 1) % Capacity;
+        ++count_;
+        return true;
+    }
+
+    /// Remove the oldest raw sample from the buffer.
+    /// Returns false when the buffer is empty.
+    bool pop(RawSample& sample)
+    {
+        if (count_ == 0)
+        {
+            return false;
+        }
+
+        sample = buffer_[tail_];
+        tail_ = (tail_ + 1) % Capacity;
+        --count_;
+        return true;
+    }
+
+    /// True when there are no stored samples.
+    bool empty() const
+    {
+        return count_ == 0;
+    }
+
+    /// Number of samples currently stored.
+    std::size_t size() const
+    {
+        return count_;
+    }
+
+    /// Maximum number of samples the buffer can hold.
+    std::size_t capacity() const
+    {
+        return Capacity;
+    }
+
+private:
+    RawSample buffer_[Capacity]{};
+    std::size_t head_ = 0;
+    std::size_t tail_ = 0;
+    std::size_t count_ = 0;
+};
+
+#endif
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\config\HardwareConfig.hpp =====
+
+#ifndef HARDWARE_CONFIG_HPP
+#define HARDWARE_CONFIG_HPP
+
+#include <Arduino.h>
+
+namespace HardwareConfig
+{
+/// Built-in LED pin for Seeed Studio XIAO nRF52840
+constexpr uint8_t LED_PIN = LED_BUILTIN;
+
+/// Active-LOW logic configuration for onboard LED
+constexpr uint8_t LED_ON = LOW;
+constexpr uint8_t LED_OFF = HIGH;
+} // namespace HardwareConfig
+
+#endif // HARDWARE_CONFIG_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\detectors\BaseMotion.hpp =====
+
+#ifndef BASE_MOTION_HPP
+#define BASE_MOTION_HPP
+
+#include <cstdint>
+#include "params/MotionState.h"
+#include "sensors/MotionFeatures.h"
+#include "utils/SlidingWindow.hpp"
+
+class BaseMotion {
+public:
+    BaseMotion(MotionState type) : type_(type), count_(0) {}
+    virtual ~BaseMotion() = default;
+
+    MotionState evaluate(const MotionFeatures& features, const SlidingWindow& window) {
+        if (!preConditionMet(features, window)) {
+            return MotionState::IDLE;
+        }
+
+        if (detectSpecificMotion(features, window)) {
+            count_++;
+            return type_;
+        }
+        return MotionState::IDLE;
+    }
+
+    uint32_t getCount() const { return count_; }
+    MotionState getType() const { return type_; }
+    void resetCount() { count_ = 0; }
+
+protected:
+    virtual bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) = 0;
+    virtual bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) = 0;
+
+private:
+    MotionState type_;
+    uint32_t count_;
+};
+
+#endif // BASE_MOTION_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\detectors\JumpMotion.hpp =====
+
+#ifndef JUMP_MOTION_HPP
+#define JUMP_MOTION_HPP
+
+#include "detectors/BaseMotion.hpp"
+#include "params/AlgoParams.hpp"
+
+enum class JumpFsmState { NORMAL, FLIGHT };
+
+class JumpMotion : public BaseMotion {
+public:
+    JumpMotion() : BaseMotion(MotionState::JUMP), jumpState_(JumpFsmState::NORMAL),
+                   flightStartMs_(0), consecutiveFlightExitSamples_(0) {}
+
+protected:
+    bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
+        if (jumpState_ == JumpFsmState::NORMAL) {
+            if (features.rawMag < AlgoParams::FLIGHT_ENTER_G) {
+                jumpState_ = JumpFsmState::FLIGHT;
+                flightStartMs_ = features.timestampMs;
+                consecutiveFlightExitSamples_ = 0;
+            }
+        } else if (jumpState_ == JumpFsmState::FLIGHT) {
+            if (features.timestampMs - flightStartMs_ > AlgoParams::FLIGHT_MAX_DURATION_MS) {
+                jumpState_ = JumpFsmState::NORMAL;
+                consecutiveFlightExitSamples_ = 0;
+            }
+        }
+        return (jumpState_ == JumpFsmState::FLIGHT);
+    }
+
+    bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
+        if (features.rawMag > AlgoParams::FLIGHT_EXIT_G) {
+            consecutiveFlightExitSamples_++;
+            
+            if (consecutiveFlightExitSamples_ >= AlgoParams::JUMP_CONSECUTIVE_FRAMES) {
+                uint32_t flightDuration = features.timestampMs - flightStartMs_;
+                jumpState_ = JumpFsmState::NORMAL;
+
+                if (flightDuration >= AlgoParams::FLIGHT_MIN_DURATION_MS && flightDuration <= AlgoParams::FLIGHT_MAX_DURATION_MS) {
+                    return true;
+                }
+            }
+        } else {
+            consecutiveFlightExitSamples_ = 0;
+        }
+        return false;
+    }
+
+private:
+    JumpFsmState jumpState_;
+    uint32_t flightStartMs_;
+    uint32_t consecutiveFlightExitSamples_;
+};
+
+#endif // JUMP_MOTION_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\detectors\StairMotion.hpp =====
+
+#ifndef STAIR_MOTION_HPP
+#define STAIR_MOTION_HPP
+
+#include "BaseMotion.hpp"
+#include "params/AlgoParams.hpp"
+#include "utils/PeakDetector.hpp"
+#include <cmath>
+#include <algorithm>
+
+enum class StairFsmState { FLAT_GAIT, STAIR_CLIMBING };
+
+class StairMotion : public BaseMotion {
+public:
+    StairMotion() : BaseMotion(MotionState::STAIRS), stairState_(StairFsmState::FLAT_GAIT),
+                    shortTimeEnergyBuffer_(0.0f), consecutiveStairFrames_(0), stepRefractoryEndMs_(0) {}
+
+protected:
+    bool preConditionMet(float rawMag, float smoothMag, float pitchAngle, uint32_t timestampMs, const SlidingWindow& window) override {
+        float frameEnergy = (smoothMag - window.getMean()) * (smoothMag - window.getMean());
+        shortTimeEnergyBuffer_ = (0.8f * shortTimeEnergyBuffer_) + (0.2f * frameEnergy);
+
+        if (shortTimeEnergyBuffer_ > AlgoParams::STAIR_ENERGY_THRESHOLD && std::fabs(pitchAngle) > AlgoParams::STAIR_PITCH_THRESHOLD) {
+            if (stairState_ == StairFsmState::FLAT_GAIT) {
+                consecutiveStairFrames_++;
+                if (consecutiveStairFrames_ >= AlgoParams::STAIR_CONSECUTIVE_FRAMES) {
+                    stairState_ = StairFsmState::STAIR_CLIMBING;
+                    consecutiveStairFrames_ = 0;
+                }
+            }
+        } else {
+            stairState_ = StairFsmState::FLAT_GAIT;
+            consecutiveStairFrames_ = 0;
+        }
+
+        return (stairState_ == StairFsmState::STAIR_CLIMBING) && (timestampMs >= stepRefractoryEndMs_);
+    }
+
+    bool detectSpecificMotion(float rawMag, float smoothMag, float pitchAngle, uint32_t timestampMs, const SlidingWindow& window) override {
+        float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
+        float clampedThreshold = std::clamp(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MIN_G, AlgoParams::STEP_THRESHOLD_MAX_G);
+
+        float peakValue = 0.0f;
+        if (peakDetector_.isPeak(smoothMag, peakValue) && peakValue > clampedThreshold) {
+            stepRefractoryEndMs_ = timestampMs + AlgoParams::STEP_REFRACTORY_MS;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    StairFsmState stairState_;
+    float shortTimeEnergyBuffer_;
+    uint8_t consecutiveStairFrames_;
+    uint32_t stepRefractoryEndMs_;
+    PeakDetector peakDetector_;
+};
+
+#endif
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\detectors\StepMotion.hpp =====
+
+#ifndef STEP_MOTION_HPP
+#define STEP_MOTION_HPP
+
+#include "detectors/BaseMotion.hpp"
+#include "params/AlgoParams.hpp"
+#include "utils/PeakDetector.hpp"
+#include <algorithm>
+
+class StepMotion : public BaseMotion {
+public:
+    StepMotion() : BaseMotion(MotionState::STEP), stepRefractoryEndMs_(0) {}
+
+protected:
+    bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
+        return features.timestampMs >= stepRefractoryEndMs_;
+    }
+
+    bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
+        float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
+        float clampedThreshold = std::clamp(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MIN_G, AlgoParams::STEP_THRESHOLD_MAX_G);
+
+        float peakValue = 0.0f;
+        if (peakDetector_.update(features.smoothMag, peakValue) && peakValue > clampedThreshold) {
+            stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    uint32_t stepRefractoryEndMs_;
+    PeakDetector peakDetector_;
+};
+
+#endif // STEP_MOTION_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\drivers\Mpu6050Sensor.h =====
+
+#ifndef MPU6050_SENSOR_H
+#define MPU6050_SENSOR_H
+
+#include "sensors/MotionSensor.h"
+
+#if !USE_MOCK_SENSOR
+/// Concrete motion sensor implementation for the MPU6050 IMU.
+class Mpu6050Sensor : public MotionSensor
+{
+public:
+    bool begin() override;
+    bool read(MotionData& out) override;
+    uint32_t i2cErrorCount() const override;
+
+private:
+    uint32_t i2cErrors_ = 0;
+    bool ready_ = false;
+};
+#endif
+#endif
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\filter\EmaFilter.hpp =====
+
+// ========================================================================================================
+// File: EmaFilter.hpp
+// Purpose: Concrete implementation of an Exponential Moving Average (EMA) filter.
+// ========================================================================================================
+
+#ifndef EMA_FILTER_HPP
+#define EMA_FILTER_HPP
+
+#include "IFilter.hpp"
+
+// ----------------------------------------------------------------------------------------------------
+// Class: EmaFilter
+// Purpose: Applies an EMA filter to smooth high-frequency jitter without introducing significant phase delay.
+// ----------------------------------------------------------------------------------------------------
+class EmaFilter : public IFilter {
+public:
+    // Constructor initializes the filter's smoothing factor (alpha) and resets the previous output.
+    EmaFilter(float alpha) : alpha_(alpha), previousOutput_(0.0f) {}
+
+    // Applies the EMA formula: y[n] = alpha * x[n] + (1 - alpha) * y[n-1]
+    float process(float input) override {
+        previousOutput_ = (alpha_ * input) + ((1.0f - alpha_) * previousOutput_);
+        return previousOutput_;
+    }
+
+private:
+    float alpha_;
+    float previousOutput_;
+};
+
+#endif // EMA_FILTER_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\filter\IFilter.hpp =====
+
+// ========================================================================================================
+// File: IFilter.hpp
+// Purpose: Abstract interface for signal filtering to adhere to the Open/Closed Principle.
+// ========================================================================================================
+
+#ifndef I_FILTER_HPP
+#define I_FILTER_HPP
+
+// ----------------------------------------------------------------------------------------------------
+// Interface: IFilter
+// Purpose: Defines a standard contract for any signal processing filter (e.g., EMA, High-Pass).
+// ----------------------------------------------------------------------------------------------------
+class IFilter {
+public:
+    // Virtual destructor to ensure proper cleanup of derived classes.
+    virtual ~IFilter() = default;
+    
+    // Processes a single raw input sample and returns the filtered output.
+    virtual float process(float input) = 0;
+};
+
+#endif // I_FILTER_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\hal\SampleTimer.h =====
+
+#ifndef SAMPLE_TIMER_H
+#define SAMPLE_TIMER_H
+
+#include <cstdint>
+#include "params/BuildFlags.h"
+
+extern volatile bool g_sampleDue;
+extern volatile uint32_t g_expectedTicks;
+extern volatile uint32_t g_sampleDrops;
+
+class SampleTimer {
+public:
+    bool begin(uint32_t intervalUs);
+    void end();
+    
+    // Safely clears the ISR flag and returns true if a sample is due.
+    bool consumeSample();
+
+private:
+    bool started_ = false;
+};
+
+#endif // SAMPLE_TIMER_H
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\params\AlgoParams.hpp =====
+
+#ifndef ALGO_PARAMS_HPP
+#define ALGO_PARAMS_HPP
+
+#include <cstddef>
+#include <cstdint>
+
+namespace AlgoParams {
+    constexpr float SAMPLE_RATE_HZ = 100.0f;
+    constexpr float TS_MS = 10.0f;
+    constexpr uint32_t SAMPLE_INTERVAL_US = 10000;
+    
+    constexpr std::size_t RING_BUFFER_CAPACITY = 64;
+    constexpr uint32_t SERIAL_BAUD = 115200;
+    
+    constexpr uint16_t IMU_ACCEL_RANGE_G = 4;
+    constexpr uint16_t IMU_GYRO_RANGE_DPS = 500;
+    constexpr uint32_t IMU_I2C_CLOCK_HZ = 400000;
+    constexpr uint8_t IMU_I2C_ADDRESS = 0x68;
+    
+    constexpr uint32_t STAT_INTERVAL_MS = 10000;
+    constexpr uint32_t LED_PULSE_DURATION_MS = 200;
+
+    constexpr std::size_t SLIDING_WINDOW_SIZE = 100;
+
+    constexpr uint32_t STEP_REFRACTORY_MS = 120;
+    constexpr float STEP_THRESHOLD_MIN_G = 1.15f;
+    constexpr float STEP_THRESHOLD_MAX_G = 1.90f;
+    constexpr float STEP_K_FACTOR = 1.5f;
+
+    constexpr float FLIGHT_ENTER_G = 0.35f;
+    constexpr float FLIGHT_EXIT_G = 0.70f;
+    constexpr uint32_t FLIGHT_MIN_DURATION_MS = 180;
+    constexpr uint32_t FLIGHT_MAX_DURATION_MS = 850;
+    constexpr uint32_t JUMP_CONSECUTIVE_FRAMES = 3;
+
+    constexpr float STAIR_ENERGY_THRESHOLD = 0.45f;
+    constexpr float STAIR_PITCH_THRESHOLD = 35.0f;
+    constexpr uint32_t STAIR_CONSECUTIVE_FRAMES = 3;
+}
+
+#endif // ALGO_PARAMS_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\params\BuildFlags.h =====
+
+#ifndef BUILD_FLAGS_H
+#define BUILD_FLAGS_H
+
+#ifndef USE_MOCK_SENSOR
+#define USE_MOCK_SENSOR 0
+#endif
+
+#define ENABLE_STREAMING 1
+#define ENABLE_SAMPLE_DROP_COUNTER 1
+#define ENABLE_DEBUG_CLI 1
+#define STREAM_DECIMAL_PLACES 4
+
+/// Compile-time sensor selection.
+/// This is set by the PlatformIO environment build flags.
+/// 0 = real IMU hardware, 1 = mock sensor mode.
+#endif
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\params\MotionState.h =====
+
+#ifndef MOTION_STATE_H
+#define MOTION_STATE_H
+
+enum class MotionState {
+    IDLE,
+    STEP,
+    JUMP,
+    STAIRS,
+    NOISE
+};
+
+#endif // MOTION_STATE_H
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\sensors\MockSensor.h =====
+
+#ifndef MOCK_SENSOR_H
+#define MOCK_SENSOR_H
+
+#include "sensors/MotionSensor.h"
+
+MotionSensor* getSensor();
+
+#endif
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\sensors\MotionFeatures.h =====
+
+#ifndef MOTION_FEATURES_H
+#define MOTION_FEATURES_H
+
+#include <cstdint>
+
+struct MotionFeatures {
+    float rawMag;
+    float smoothMag;
+    float pitchAngle;
+    uint32_t timestampMs;
+};
+
+#endif // MOTION_FEATURES_H
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\sensors\MotionSensor.h =====
+
+#ifndef MOTION_SENSOR_H
+#define MOTION_SENSOR_H
+
+#include <cstdint>
+
+struct MotionData {
+    float accelX;
+    float accelY;
+    float accelZ;
+    float gyroX;
+    float gyroY;
+    float gyroZ;
+    uint32_t sequence;
+    uint32_t timestampMs;
+};
+
+class MotionSensor {
+public:
+    virtual ~MotionSensor() = default;
+    virtual bool begin() = 0;
+    virtual bool read(MotionData& out) = 0;
+    virtual uint32_t i2cErrorCount() const = 0;
+};
+
+#endif // MOTION_SENSOR_H
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\streaming\DebugCli.h =====
+
+#include "streaming/DebugCli.h"
+#include "params/BuildFlags.h"
+#include "hal/SampleTimer.h"
+#include "streaming/SerialStreamer.h"
+#include <Arduino.h>
+#include <cstring>
+
+void DebugCli::begin(SerialStreamer* streamer)
+{
+    streamer_ = streamer;
+    lineLength_ = 0;
+    rateWindowStartMs_ = millis();
+    rateWindowSamples_ = 0;
+}
+
+void DebugCli::setSampleCount(uint32_t count)
+{
+    sampleCount_ = count;
+}
+
+void DebugCli::setI2cErrors(uint32_t errors)
+{
+    i2cErrors_ = errors;
+}
+
+void DebugCli::poll()
+{
+#if !ENABLE_DEBUG_CLI
+    return;
+#endif
+
+    while (Serial.available() > 0)
+    {
+        const char c = static_cast<char>(Serial.read());
+        if (c == '\r') continue;
+
+        if (c == '\n')
+        {
+            lineBuffer_[lineLength_] = '\0';
+            if (lineLength_ > 0) processLine(lineBuffer_);
+            lineLength_ = 0;
+            continue;
+        }
+
+        if (lineLength_ + 1 < sizeof(lineBuffer_))
+        {
+            lineBuffer_[lineLength_++] = c;
+        }
+    }
+}
+
+void DebugCli::processLine(const char* line)
+{
+    if (line[0] == '#') ++line;
+
+    if (strcmp(line, "help") == 0) printHelp();
+    else if (strcmp(line, "stats") == 0) printStats();
+    else if (strcmp(line, "reset") == 0)
+    {
+        g_sampleDrops = 0;
+        g_expectedTicks = 0;
+        sampleCount_ = 0;
+        rateWindowStartMs_ = millis();
+        rateWindowSamples_ = 0;
+        Serial.println(F("OK counters reset"));
+    }
+    else if (strcmp(line, "stream on") == 0)
+    {
+        if (streamer_ != nullptr) streamer_->setEnabled(true);
+        Serial.println(F("OK stream on"));
+    }
+    else if (strcmp(line, "stream off") == 0)
+    {
+        if (streamer_ != nullptr) streamer_->setEnabled(false);
+        Serial.println(F("OK stream off"));
+    }
+    else if (strcmp(line, "rate") == 0) printRate();
+    else Serial.println(F("ERR unknown command (try help)"));
+}
+
+void DebugCli::printHelp() const
+{
+    Serial.println(F("Commands:"));
+    Serial.println(F("  help        - list commands"));
+    Serial.println(F("  stats       - print counters"));
+    Serial.println(F("  reset       - reset drop/sample counters"));
+    Serial.println(F("  stream on   - enable CSV output"));
+    Serial.println(F("  stream off  - disable CSV output"));
+    Serial.println(F("  rate        - print measured sample rate"));
+}
+
+void DebugCli::printStats() const
+{
+    Serial.print(F("STATS samples=")); Serial.print(sampleCount_);
+    Serial.print(F(" drops=")); Serial.print(g_sampleDrops);
+    Serial.print(F(" expected_ticks=")); Serial.print(g_expectedTicks);
+    Serial.print(F(" i2c_errors=")); Serial.println(i2cErrors_);
+}
+
+void DebugCli::printRate() const
+{
+    const uint32_t nowMs = millis();
+    const uint32_t elapsedMs = nowMs - rateWindowStartMs_;
+    if (elapsedMs == 0)
+    {
+        Serial.println(F("RATE unavailable"));
+        return;
+    }
+
+    const float rateHz = (static_cast<float>(rateWindowSamples_) * 1000.0f) / static_cast<float>(elapsedMs);
+    Serial.print(F("RATE hz=")); Serial.println(rateHz, 2);
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\streaming\SerialStreamer.h =====
+
+#include "streaming/SerialStreamer.h"
+#include "params/AlgoParams.hpp"
+#include "params/BuildFlags.h"
+#include "hal/SampleTimer.h"
+#include <Arduino.h>
+
+void SerialStreamer::begin()
+{
+    enabled_ = true;
+    lastStatMs_ = millis();
+}
+
+void SerialStreamer::setEnabled(bool enabled)
+{
+    enabled_ = enabled;
+}
+
+bool SerialStreamer::enabled() const
+{
+    return enabled_;
+}
+
+void SerialStreamer::streamSample(const RawSample& sample)
+{
+#if ENABLE_STREAMING
+    if (!enabled_) return;
+
+    Serial.print(F(">Accel_X:")); Serial.println(sample.ax, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Accel_Y:")); Serial.println(sample.ay, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Accel_Z:")); Serial.println(sample.az, STREAM_DECIMAL_PLACES);
+
+    Serial.print(F(">Gyro_X:")); Serial.println(sample.gx, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Gyro_Y:")); Serial.println(sample.gy, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Gyro_Z:")); Serial.println(sample.gz, STREAM_DECIMAL_PLACES);
+#endif
+}
+
+void SerialStreamer::maybePrintStats(uint32_t& samplesSinceLastStat, uint32_t i2cErrors)
+{
+    const uint32_t nowMs = millis();
+    if ((nowMs - lastStatMs_) < AlgoParams::STAT_INTERVAL_MS) return;
+
+    lastStatMs_ = nowMs;
+
+    const float elapsedSec = AlgoParams::STAT_INTERVAL_MS / 1000.0f;
+    const float rateHz = elapsedSec > 0.0f ? static_cast<float>(samplesSinceLastStat) / elapsedSec : 0.0f;
+
+    Serial.print(F("STAT,samples=")); Serial.print(samplesSinceLastStat);
+    Serial.print(F(",drops="));
+
+#if ENABLE_SAMPLE_DROP_COUNTER
+    Serial.print(g_sampleDrops);
+#else
+    Serial.print(F("0"));
+#endif
+
+    Serial.print(F(",i2c_errors=")); Serial.print(i2cErrors);
+    Serial.print(F(",rate_hz=")); Serial.println(rateHz, 1);
+
+    samplesSinceLastStat = 0;
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\utils\PeakDetector.hpp =====
+
+#ifndef PEAK_DETECTOR_HPP
+#define PEAK_DETECTOR_HPP
+
+class PeakDetector {
+public:
+    PeakDetector() : previousVal_(0.0f), prePreviousVal_(0.0f) {}
+
+    bool update(float currentVal, float& outPeakValue) {
+        bool peakFound = (previousVal_ > prePreviousVal_) && (previousVal_ > currentVal);
+        outPeakValue = previousVal_;
+        
+        prePreviousVal_ = previousVal_;
+        previousVal_ = currentVal;
+        
+        return peakFound;
+    }
+
+private:
+    float previousVal_;
+    float prePreviousVal_;
+};
+
+#endif // PEAK_DETECTOR_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\utils\SlidingWindow.hpp =====
+
+#ifndef SLIDING_WINDOW_HPP
+#define SLIDING_WINDOW_HPP
+
+#include "params/AlgoParams.hpp"
+#include <cstddef>
+
+class SlidingWindow {
+public:
+    SlidingWindow();
+    void push(float value);
+    float getMean() const;
+    float getStdDev() const;
+    bool isFull() const;
+    void clear();
+
+private:
+    float buffer_[AlgoParams::SLIDING_WINDOW_SIZE]{};
+    std::size_t head_ = 0;
+    std::size_t count_ = 0;
+    float sum_ = 0.0f;
+    float sumSq_ = 0.0f;
+};
+
+#endif // SLIDING_WINDOW_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_hardware_sensor\test_hardware_sensor.cpp =====
+
+#include <Arduino.h>
+#include <unity.h>
+#include "drivers/Mpu6050Sensor.h" 
+
+Mpu6050Sensor sensor;
+
+void setUp(void) {
+    // Ensure the sensor is initialized before EVERY test runs.
+    sensor.begin();
+}
+
+void tearDown(void) {
+    // No per-test teardown required.
+}
+
+// Test 1: Verify sensor initialization and I2C connectivity.
+void test_sensor_connection(void) {
+    bool isConnected = sensor.begin();
+    TEST_ASSERT_TRUE_MESSAGE(isConnected, "Sensor init failed! Check I2C wiring (SDA/SCL) and power.");
+}
+
+// Test 2: Read motion data and verify it appears valid.
+void test_sensor_read_valid_data(void) {
+    MotionData data;
+    
+    // Ensure the sensor read function succeeds.
+    bool readSuccess = sensor.read(data);
+    TEST_ASSERT_TRUE_MESSAGE(readSuccess, "Failed to read data from the sensor.");
+
+    // Compute the vector magnitude of acceleration.
+    float magnitude = sqrt(data.accelX * data.accelX + 
+                           data.accelY * data.accelY + 
+                           data.accelZ * data.accelZ);
+    
+    // Ensure the data includes a gravity-level acceleration reading.
+    bool hasGravity = (magnitude > 0.5f);
+    TEST_ASSERT_TRUE_MESSAGE(hasGravity, "Sensor data is 0! Is it sleeping/broken?");
+}
+
+void setup() {
+    delay(2000); // Allow the board and sensor to wake after power-up.
+    UNITY_BEGIN();
+    
+    RUN_TEST(test_sensor_connection);
+    RUN_TEST(test_sensor_read_valid_data);
+    
+    UNITY_END();
+    delay(1000); // Critical: Wait for Serial buffer to flush before board resets.
+}
+
+void loop() {
+    // Empty loop for Unity tests.
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_mock_sensor\test_mock_sensor.cpp =====
+
+#include <Arduino.h>
+#include <unity.h>
+#include "sensors/MockSensor.h"
+
+void setUp(void) {}
+void tearDown(void) {}
+
+void test_mock_sensor_initializes_and_reads(void)
+{
+    MotionSensor* sensor = getSensor();
+    TEST_ASSERT_NOT_NULL_MESSAGE(sensor, "Mock sensor instance should not be null.");
+
+    bool started = sensor->begin();
+    TEST_ASSERT_TRUE_MESSAGE(started, "Mock sensor should initialize successfully.");
+
+    MotionData motion{};
+    bool readOk = sensor->read(motion);
+    TEST_ASSERT_TRUE_MESSAGE(readOk, "Mock sensor should return data successfully.");
+
+    TEST_ASSERT_TRUE_MESSAGE(motion.timestampMs > 0, "Mock motion sample should include a valid timestamp.");
+}
+
+void setup()
+{
+    delay(2000);
+    UNITY_BEGIN();
+    RUN_TEST(test_mock_sensor_initializes_and_reads);
+    UNITY_END();
+}
+
+void loop() {}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_motion_algorithms\TestHelpers.h =====
+
+#ifndef TEST_HELPERS_H
+#define TEST_HELPERS_H
+
+#include "algorithem/MotionClassifier.h"
+
+// Advances the classifier state to stabilize the sliding window calculations
+inline void stabilizeWindow(MotionClassifier& classifier, uint32_t& clockMs) {
+    MotionData idleData = {0};
+    idleData.accelZ = 1.0f;
+    for (int i = 0; i < 100; i++) {
+        idleData.timestampMs = clockMs;
+        classifier.update(idleData);
+        clockMs += 10;
+    }
+}
+
+#endif // TEST_HELPERS_H
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_motion_algorithms\test_jump.cpp =====
+
+// ========================================================================================================
+// File: test_jump.cpp
+// Purpose: Extensively tests the Airborne Free-Fall -> Landing Impact FSM including extreme edge cases,
+// high jumps, long jumps, and rope skipping variations.
+// ========================================================================================================
+
+#include <Arduino.h>
+#include <unity.h>
+#include "algorithm/MotionClassifier.h"
+#include "filter/EmaFilter.hpp"
+#include "JumpMotion.hpp"
+#include "StepMotion.hpp"
+
+// ----------------------------------------------------------------------------------------------------
+// Helper Function: Stabilize Window
+// ----------------------------------------------------------------------------------------------------
+#include "TestHelpers.h"
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Flight Too Short Rejected
+// ----------------------------------------------------------------------------------------------------
+void test_flight_too_short_rejected() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    JumpMotion jumpDetector;
+    classifier.addDetector(&jumpDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData data = {0};
+    data.accelZ = 0.1f; // Free fall (< 0.35g)
+    
+    // Only 100ms of flight (minimum requirement is 180ms)
+    for (int i = 0; i < 10; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    data.accelZ = 2.0f; // Impact
+    MotionState result = MotionState::IDLE;
+    for (int i = 0; i < 5; i++) {
+        data.timestampMs = clockMs;
+        MotionState frameState = classifier.update(data);
+        if (frameState == MotionState::JUMP) {
+            result = frameState;
+        }
+        clockMs += 10;
+    }
+
+    TEST_ASSERT_NOT_EQUAL(MotionState::JUMP, result);
+    TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Soft Landing Jump
+// ----------------------------------------------------------------------------------------------------
+void test_soft_landing_jump() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    JumpMotion jumpDetector;
+    classifier.addDetector(&jumpDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData data = {0};
+    data.accelZ = 0.1f; 
+    
+    // 300ms of valid flight
+    for (int i = 0; i < 30; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    // Soft landing impact (0.8g), crosses the 0.7g threshold but nowhere near 3.0g
+    data.accelZ = 0.8f;
+    MotionState result = MotionState::IDLE;
+    for (int i = 0; i < 5; i++) {
+        data.timestampMs = clockMs;
+        MotionState frameState = classifier.update(data);
+        if (frameState == MotionState::JUMP) {
+            result = frameState;
+        }
+        clockMs += 10;
+    }
+
+    TEST_ASSERT_EQUAL(MotionState::JUMP, result);
+    TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: High Jump (Hard Landing)
+// ----------------------------------------------------------------------------------------------------
+void test_high_jump_hard_landing() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    JumpMotion jumpDetector;
+    classifier.addDetector(&jumpDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData data = {0};
+    
+    // Flight (400ms)
+    data.accelZ = 0.1f; 
+    for (int i = 0; i < 40; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    // Hard Impact (4.0g - Extreme force)
+    data.accelZ = 4.0f;
+    MotionState result = MotionState::IDLE;
+    for (int i = 0; i < 5; i++) {
+        data.timestampMs = clockMs;
+        MotionState frameState = classifier.update(data);
+        if (frameState == MotionState::JUMP) {
+            result = frameState;
+        }
+        clockMs += 10;
+    }
+
+    TEST_ASSERT_EQUAL(MotionState::JUMP, result);
+    TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Long Jump (Soft Landing)
+// ----------------------------------------------------------------------------------------------------
+void test_long_jump_soft_landing() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    JumpMotion jumpDetector;
+    classifier.addDetector(&jumpDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData data = {0};
+    
+    // Flight (700ms - Long horizontal jump)
+    data.accelZ = 0.2f; 
+    for (int i = 0; i < 70; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    // Softer horizontal impact (2.0g)
+    data.accelZ = 2.0f;
+    MotionState result = MotionState::IDLE;
+    for (int i = 0; i < 5; i++) {
+        data.timestampMs = clockMs;
+        MotionState frameState = classifier.update(data);
+        if (frameState == MotionState::JUMP) {
+            result = frameState;
+        }
+        clockMs += 10;
+    }
+
+    TEST_ASSERT_EQUAL(MotionState::JUMP, result);
+    TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Rope Skipping Counted as Steps Not Jumps
+// ----------------------------------------------------------------------------------------------------
+void test_skipping_counted_as_steps_not_jumps() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    StepMotion stepDetector;
+    JumpMotion jumpDetector;
+    
+    classifier.addDetector(&jumpDetector);
+    classifier.addDetector(&stepDetector); 
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    // Simulate 10 realistic rope skips 
+    for (int skip = 0; skip < 10; skip++) {
+        MotionData data = {0};
+        
+        // Short flight (~150ms) - Safely below the 180ms Jump minimum
+        data.accelZ = 0.2f; 
+        for (int i = 0; i < 15; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+
+        // Quick Impact (~50ms at 2.5g)
+        data.accelZ = 2.5f;
+        for (int i = 0; i < 5; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+        
+        // Rest phase on the ground (~600ms)
+        // This is crucial: It allows the 1-second O(1) Sliding Window to flush out 
+        // the extreme variance, allowing the dynamic threshold to reset for the next step.
+        data.accelZ = 1.0f;
+        for (int i = 0; i < 60; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+    }
+
+    // Verify 10 skips counted entirely as Steps, 0 Jumps detected.
+    TEST_ASSERT_EQUAL(10, stepDetector.getCount());
+    TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Unity Environment
+// ----------------------------------------------------------------------------------------------------
+void setUp(void) {}
+void tearDown(void) {}
+
+void setup() {
+    delay(2000);
+    UNITY_BEGIN();
+    RUN_TEST(test_flight_too_short_rejected);
+    RUN_TEST(test_soft_landing_jump);
+    RUN_TEST(test_high_jump_hard_landing);
+    RUN_TEST(test_long_jump_soft_landing);
+    RUN_TEST(test_skipping_counted_as_steps_not_jumps);
+    UNITY_END();
+}
+
+void loop() {}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_motion_algorithms\test_stair.cpp =====
+
+// ========================================================================================================
+// File: test_stair.cpp
+// Purpose: Validates the combined short-time energy and extreme pitch thresholds for stair climbing, 
+// and ensures proper state transitions between stair climbing and flat walking.
+// ========================================================================================================
+
+#include <Arduino.h>
+#include <unity.h>
+#include "MotionClassifier.h"
+#include "EmaFilter.hpp"
+#include "StairMotion.hpp"
+#include "StepMotion.hpp"
+
+// ----------------------------------------------------------------------------------------------------
+// Helper Function: Stabilize Window
+// ----------------------------------------------------------------------------------------------------
+#include "TestHelpers.h"
+
+// ----------------------------------------------------------------------------------------------------
+// Test: High Energy Flat Walk Rejected
+// ----------------------------------------------------------------------------------------------------
+void test_high_energy_flat_walk_rejected() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    StairMotion stairDetector;
+    classifier.addDetector(&stairDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData data = {0};
+    data.accelX = 0.0f; // Zero pitch
+    data.accelZ = 2.5f; // High vertical energy
+
+    MotionState result = MotionState::IDLE;
+    for (int i = 0; i < 10; i++) {
+        data.timestampMs = clockMs;
+        MotionState frameState = classifier.update(data);
+        if (frameState == MotionState::STAIRS) {
+            result = frameState;
+        }
+        clockMs += 10;
+    }
+
+    TEST_ASSERT_NOT_EQUAL(MotionState::STAIRS, result);
+    TEST_ASSERT_EQUAL(0, stairDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Stairs to Flat Walking Transition
+// ----------------------------------------------------------------------------------------------------
+void test_stairs_to_flat_walking_transition() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    StepMotion stepDetector;
+    StairMotion stairDetector;
+    
+    classifier.addDetector(&stairDetector);
+    classifier.addDetector(&stepDetector);
+
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData data = {0};
+
+    // Phase 1: Climb 2 stairs (High energy + high pitch)
+    data.accelX = 1.5f; 
+    data.accelZ = 1.5f; 
+    
+    for (int step = 0; step < 2; step++) {
+        for (int i = 0; i < 5; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+        clockMs += 400; // Delay between stairs
+    }
+
+    // Phase 2: Reach the top, start flat walking
+    data.accelX = 0.0f; // Pitch ~0
+    data.accelZ = 1.5f; // Purely vertical impact
+
+    for (int step = 0; step < 3; step++) {
+        for (int i = 0; i < 5; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+        clockMs += 400;
+    }
+
+    TEST_ASSERT_EQUAL(2, stairDetector.getCount());
+    TEST_ASSERT_EQUAL(3, stepDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Unity Environment
+// ----------------------------------------------------------------------------------------------------
+void setUp(void) {}
+void tearDown(void) {}
+
+void setup() {
+    delay(2000);
+    UNITY_BEGIN();
+    RUN_TEST(test_high_energy_flat_walk_rejected);
+    RUN_TEST(test_stairs_to_flat_walking_transition);
+    UNITY_END();
+}
+
+void loop() {}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_motion_algorithms\test_step.cpp =====
+
+// ========================================================================================================
+// File: test_step.cpp
+// Purpose: Unit tests dedicated to Step detection logic, adaptive thresholds, noise rejection, 
+// and dynamic state transitions (e.g., distinguishing running/skipping from jumping).
+// ========================================================================================================
+
+#include <Arduino.h>
+#include <unity.h>
+#include "MotionClassifier.h"
+#include "EmaFilter.hpp"
+#include "StepMotion.hpp"
+#include "JumpMotion.hpp"
+
+// ----------------------------------------------------------------------------------------------------
+// Helper Function: Stabilize Window
+// ----------------------------------------------------------------------------------------------------
+#include "TestHelpers.h"
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Weak Slow Step
+// ----------------------------------------------------------------------------------------------------
+void test_weak_slow_step() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    StepMotion stepDetector;
+    classifier.addDetector(&stepDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData stepData = {0};
+    stepData.accelX = 0.6f; 
+    stepData.accelZ = 1.0f; 
+    stepData.timestampMs = clockMs + 100;
+
+    MotionState result = classifier.update(stepData);
+    TEST_ASSERT_EQUAL(MotionState::STEP, result);
+    TEST_ASSERT_EQUAL(1, stepDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Debounce Double Impact Rejection
+// ----------------------------------------------------------------------------------------------------
+void test_debounce_double_impact_rejection() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    StepMotion stepDetector;
+    classifier.addDetector(&stepDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData stepData = {0};
+    stepData.accelX = 1.5f; 
+    stepData.accelZ = 1.0f;
+
+    stepData.timestampMs = clockMs + 100;
+    classifier.update(stepData);
+
+    // Second impact only 50ms later falls inside the refractory period
+    stepData.timestampMs = clockMs + 150;
+    classifier.update(stepData);
+
+    TEST_ASSERT_EQUAL(1, stepDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Running is Counted as Steps, Not Jumps
+// ----------------------------------------------------------------------------------------------------
+void test_running_is_counted_as_steps_not_jumps() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    StepMotion stepDetector;
+    JumpMotion jumpDetector;
+    
+    classifier.addDetector(&jumpDetector);
+    classifier.addDetector(&stepDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs); 
+
+    // Simulate 4 fast running steps
+    for (int step = 0; step < 4; step++) {
+        MotionData data = {0};
+        
+        // Flight phase of running (short duration, ~100ms)
+        data.accelZ = 0.4f; 
+        for (int i = 0; i < 10; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+
+        // Hard impact phase of running (high G force)
+        data.accelZ = 2.5f;
+        for (int i = 0; i < 5; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+        
+        clockMs += 100; // Wait out the step debounce timer
+    }
+
+    TEST_ASSERT_EQUAL(4, stepDetector.getCount());
+    TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Sitting Foot Tapping Rejection
+// ----------------------------------------------------------------------------------------------------
+void test_sitting_foot_tapping_rejection() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    StepMotion stepDetector;
+    classifier.addDetector(&stepDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData data = {0};
+
+    // Simulate 3 seconds of rapid, low-amplitude foot tapping
+    for (int i = 0; i < 300; i++) {
+        // Sine wave approximation between 0.9g and 1.1g
+        data.accelZ = 1.0f + (0.1f * std::sin(i * 0.5f)); 
+        data.timestampMs = clockMs;
+        
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    TEST_ASSERT_EQUAL(0, stepDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Unity Environment
+// ----------------------------------------------------------------------------------------------------
+void setUp(void) {}
+void tearDown(void) {}
+
+void setup() {
+    delay(2000);
+    UNITY_BEGIN();
+    RUN_TEST(test_weak_slow_step);
+    RUN_TEST(test_debounce_double_impact_rejection);
+    RUN_TEST(test_running_is_counted_as_steps_not_jumps);
+    RUN_TEST(test_sitting_foot_tapping_rejection);
+    UNITY_END();
+}
+
+void loop() {}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_motion_algorithms\test_stress.cpp =====
+
+// ========================================================================================================
+// File: test_stress.cpp
+// Purpose: Stress tests including Marathon simulations, sudden stops, complex multi-motion transitions, 
+// and random vibration noise rejection over extended time periods.
+// ========================================================================================================
+
+#include <Arduino.h>
+#include <unity.h>
+#include "MotionClassifier.h"
+#include "EmaFilter.hpp"
+#include "StepMotion.hpp"
+#include "JumpMotion.hpp"
+
+// ----------------------------------------------------------------------------------------------------
+// Helper Function: Stabilize Window
+// ----------------------------------------------------------------------------------------------------
+#include "TestHelpers.h"
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Marathon Stress (5000 Steps)
+// ----------------------------------------------------------------------------------------------------
+void test_marathon_stress_5000_steps() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    StepMotion stepDetector;
+    classifier.addDetector(&stepDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    // Simulate 5000 continuous fast steps
+    for (int i = 0; i < 5000; i++) {
+        MotionData stepData = {0};
+        stepData.accelX = 1.5f;
+        stepData.accelZ = 1.0f;
+        stepData.timestampMs = clockMs;
+        
+        classifier.update(stepData);
+        clockMs += 400; // Clear debounce
+    }
+
+    TEST_ASSERT_EQUAL(5000, stepDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Jump Stress Marathon (50 Jumps)
+// ----------------------------------------------------------------------------------------------------
+void test_jump_stress_marathon() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    JumpMotion jumpDetector;
+    classifier.addDetector(&jumpDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    for (int jump = 0; jump < 50; jump++) {
+        MotionData data = {0};
+        
+        // Flight (250ms)
+        data.accelZ = 0.15f; 
+        for (int i = 0; i < 25; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+
+        // Impact (2.8g)
+        data.accelZ = 2.8f;
+        for (int i = 0; i < 5; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+        
+        // Recovery
+        data.accelZ = 1.0f;
+        for (int i = 0; i < 30; i++) {
+            data.timestampMs = clockMs;
+            classifier.update(data);
+            clockMs += 10;
+        }
+    }
+
+    TEST_ASSERT_EQUAL(50, jumpDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Sudden Stop No False Jumps
+// ----------------------------------------------------------------------------------------------------
+void test_sudden_stop_no_false_jumps() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    JumpMotion jumpDetector;
+    classifier.addDetector(&jumpDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData data = {0};
+    
+    // Simulate high-impact running
+    data.accelX = 2.0f;
+    data.accelZ = 1.0f;
+    for (int i = 0; i < 50; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    // Sudden complete stop to 1.0g
+    data.accelX = 0.0f;
+    data.accelZ = 1.0f;
+    for (int i = 0; i < 100; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test: Complex Transition (Walk -> Jump -> Walk)
+// ----------------------------------------------------------------------------------------------------
+void test_complex_transition_walk_jump_walk() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    StepMotion stepDetector;
+    JumpMotion jumpDetector;
+    
+    classifier.addDetector(&jumpDetector);
+    classifier.addDetector(&stepDetector);
+
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    MotionData data = {0};
+
+    // Phase 1: Walk 2 steps
+    data.accelZ = 1.8f;
+    data.timestampMs = clockMs;
+    classifier.update(data);
+    clockMs += 500; 
+
+    data.timestampMs = clockMs;
+    classifier.update(data);
+    clockMs += 500;
+
+    // Phase 2: Jump over an obstacle
+    data.accelZ = 0.1f; // Free fall
+    for (int i = 0; i < 25; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+    data.accelZ = 3.0f; // Landing
+    for (int i = 0; i < 5; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    clockMs += 400; // Recovery pause after landing
+
+    // Phase 3: Walk 2 more steps
+    data.accelZ = 1.6f;
+    data.timestampMs = clockMs;
+    classifier.update(data);
+    clockMs += 500;
+
+    data.timestampMs = clockMs;
+    classifier.update(data);
+
+    TEST_ASSERT_EQUAL(4, stepDetector.getCount());
+    TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Unity Environment
+// ----------------------------------------------------------------------------------------------------
+void setUp(void) {}
+void tearDown(void) {}
+
+void setup() {
+    delay(2000);
+    UNITY_BEGIN();
+    RUN_TEST(test_marathon_stress_5000_steps);
+    RUN_TEST(test_jump_stress_marathon);
+    RUN_TEST(test_sudden_stop_no_false_jumps);
+    RUN_TEST(test_complex_transition_walk_jump_walk);
+    UNITY_END();
+}
+
+void loop() {}

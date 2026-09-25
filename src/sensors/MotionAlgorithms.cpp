@@ -1,4 +1,4 @@
-#include "MotionAlgorithms.h"
+#include "sensors/MotionSensor.h"
 #include <cmath>
 
 float calculateAccelerationMagnitude(MotionData data)

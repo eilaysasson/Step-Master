@@ -1,7 +1,7 @@
 #ifndef MPU6050_SENSOR_H
 #define MPU6050_SENSOR_H
 
-#include "MotionSensor.h"
+#include "sensors/MotionSensor.h"
 
 #if !USE_MOCK_SENSOR
 /// Concrete motion sensor implementation for the MPU6050 IMU.

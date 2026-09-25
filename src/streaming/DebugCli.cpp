@@ -1,6 +1,6 @@
 #include "streaming/DebugCli.h"
 
-#include "BuildFlags.h"
+#include "params/BuildFlags.h"
 #include "hal/SampleTimer.h"
 #include "streaming/SerialStreamer.h"
 
