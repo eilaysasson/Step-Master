@@ -6,10 +6,10 @@
 
 #include <Arduino.h>
 #include <unity.h>
-#include "MotionClassifier.h"
-#include "EmaFilter.hpp"
-#include "StairMotion.hpp"
-#include "StepMotion.hpp"
+#include "algorithem/MotionClassifier.h"
+#include "filter/EmaFilter.hpp"
+#include "detectors/StairMotion.hpp"
+#include "detectors/StepMotion.hpp"
 
 // ----------------------------------------------------------------------------------------------------
 // Helper Function: Stabilize Window
