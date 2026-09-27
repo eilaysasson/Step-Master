@@ -1,12 +1,11 @@
 // ========================================================================================================
 // File: main.cpp
 // Purpose: Production composition root. Wires hardware sensors, ISR timers, ring buffers, streaming, 
-// and the DSP classification engine into a non-blocking 100Hz pipeline.
+// the DSP classification engine, and the BLE Manager into a non-blocking 100Hz pipeline.
 // ========================================================================================================
 
 #include <Arduino.h>
 
-// Use the correct PlatformIO unit testing flag to prevent multiple definitions
 #ifndef PIO_UNIT_TESTING
 
 #include "params/AlgoParams.hpp"
@@ -17,6 +16,7 @@
 #include "buffers/RingBuffer.hpp"
 #include "streaming/SerialStreamer.h"
 #include "streaming/DebugCli.h"
+#include "streaming/BLEManager.h" 
 
 #include "algorithem/MotionClassifier.h"
 #include "filter/EmaFilter.hpp"
@@ -37,6 +37,7 @@ SampleTimer sampleTimer;
 SampleRingBuffer<AlgoParams::RING_BUFFER_CAPACITY> ringBuffer;
 SerialStreamer streamer;
 DebugCli cli;
+BLEManager bleFacade; 
 
 EmaFilter mainFilter(0.53f);
 MotionClassifier classifier(&mainFilter);
@@ -47,6 +48,7 @@ StairMotion stairDetector;
 uint32_t totalSamplesProcessed = 0;
 uint32_t ledTurnOffTimestampMs = 0;
 bool isLedActive = false;
+uint32_t globalSequence = 0; 
 
 void setup() {
     Serial.begin(AlgoParams::SERIAL_BAUD);
@@ -61,6 +63,7 @@ void setup() {
 
     streamer.begin();
     cli.begin(&streamer);
+    bleFacade.begin(); 
 
     classifier.addDetector(&jumpDetector);
     classifier.addDetector(&stairDetector);
@@ -83,14 +86,14 @@ void setup() {
 
 void loop() {
     cli.poll();
+    bleFacade.poll(); 
 
-    // Consume the timer tick securely to prevent ISR race conditions
     if (sampleTimer.consumeSample()) {
         MotionData rawData;
         if (sensor->read(rawData)) {
             RawSample rSample;
-            rSample.sequence = rawData.sequence;
-            rSample.timestampMs = rawData.timestampMs;
+            rSample.sequence = globalSequence++;
+            rSample.timestampMs = millis(); 
             rSample.ax = rawData.accelX;
             rSample.ay = rawData.accelY;
             rSample.az = rawData.accelZ;
@@ -125,11 +128,15 @@ void loop() {
             ledTurnOffTimestampMs = millis() + AlgoParams::LED_PULSE_DURATION_MS;
             isLedActive = true;
 
-            Serial.print("[EVENT] State: ");
-            Serial.print(static_cast<int>(currentState));
+            Serial.print("[EVENT] Time: "); Serial.print(mData.timestampMs);
+            Serial.print(" | State: "); Serial.print(static_cast<int>(currentState));
             Serial.print(" | Steps: "); Serial.print(stepDetector.getCount());
             Serial.print(" | Jumps: "); Serial.print(jumpDetector.getCount());
             Serial.print(" | Stairs: "); Serial.println(stairDetector.getCount());
+            
+            // Send the raw data to the Facade directly. 
+            // The BLE Broadcaster Singleton handles change-detection and TX buffer protection internally.
+            bleFacade.updateTelemetry(currentState, stepDetector.getCount(), jumpDetector.getCount(), stairDetector.getCount()); 
         }
 
         totalSamplesProcessed++;

@@ -202,11 +202,11 @@ void test_skipping_counted_as_steps_not_jumps() {
             clockMs += 10;
         }
         
-        // Rest phase on the ground (~600ms)
-        // This is crucial: It allows the 1-second O(1) Sliding Window to flush out 
-        // the extreme variance, allowing the dynamic threshold to reset for the next step.
+        // Rest phase on the ground (~1000ms)
+        // This is crucial: It allows the 1-second O(1) Sliding Window to completely flush out 
+        // the extreme variance, allowing the dynamic threshold to fully reset for the next step.
         data.accelZ = 1.0f;
-        for (int i = 0; i < 60; i++) {
+        for (int i = 0; i < 100; i++) { // Changed from 60 to 100
             data.timestampMs = clockMs;
             classifier.update(data);
             clockMs += 10;

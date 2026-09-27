@@ -4,12 +4,11 @@
 // ========================================================================================================
 // File: main.cpp
 // Purpose: Production composition root. Wires hardware sensors, ISR timers, ring buffers, streaming, 
-// and the DSP classification engine into a non-blocking 100Hz pipeline.
+// the DSP classification engine, and the BLE Manager into a non-blocking 100Hz pipeline.
 // ========================================================================================================
 
 #include <Arduino.h>
 
-// Use the correct PlatformIO unit testing flag to prevent multiple definitions
 #ifndef PIO_UNIT_TESTING
 
 #include "params/AlgoParams.hpp"
@@ -20,6 +19,7 @@
 #include "buffers/RingBuffer.hpp"
 #include "streaming/SerialStreamer.h"
 #include "streaming/DebugCli.h"
+#include "streaming/BLEManager.h" 
 
 #include "algorithem/MotionClassifier.h"
 #include "filter/EmaFilter.hpp"
@@ -40,6 +40,7 @@ SampleTimer sampleTimer;
 SampleRingBuffer<AlgoParams::RING_BUFFER_CAPACITY> ringBuffer;
 SerialStreamer streamer;
 DebugCli cli;
+BLEManager bleFacade; 
 
 EmaFilter mainFilter(0.53f);
 MotionClassifier classifier(&mainFilter);
@@ -50,6 +51,7 @@ StairMotion stairDetector;
 uint32_t totalSamplesProcessed = 0;
 uint32_t ledTurnOffTimestampMs = 0;
 bool isLedActive = false;
+uint32_t globalSequence = 0; 
 
 void setup() {
     Serial.begin(AlgoParams::SERIAL_BAUD);
@@ -64,6 +66,7 @@ void setup() {
 
     streamer.begin();
     cli.begin(&streamer);
+    bleFacade.begin(); 
 
     classifier.addDetector(&jumpDetector);
     classifier.addDetector(&stairDetector);
@@ -86,14 +89,14 @@ void setup() {
 
 void loop() {
     cli.poll();
+    bleFacade.poll(); 
 
-    // Consume the timer tick securely to prevent ISR race conditions
     if (sampleTimer.consumeSample()) {
         MotionData rawData;
         if (sensor->read(rawData)) {
             RawSample rSample;
-            rSample.sequence = rawData.sequence;
-            rSample.timestampMs = rawData.timestampMs;
+            rSample.sequence = globalSequence++;
+            rSample.timestampMs = millis(); 
             rSample.ax = rawData.accelX;
             rSample.ay = rawData.accelY;
             rSample.az = rawData.accelZ;
@@ -128,11 +131,15 @@ void loop() {
             ledTurnOffTimestampMs = millis() + AlgoParams::LED_PULSE_DURATION_MS;
             isLedActive = true;
 
-            Serial.print("[EVENT] State: ");
-            Serial.print(static_cast<int>(currentState));
+            Serial.print("[EVENT] Time: "); Serial.print(mData.timestampMs);
+            Serial.print(" | State: "); Serial.print(static_cast<int>(currentState));
             Serial.print(" | Steps: "); Serial.print(stepDetector.getCount());
             Serial.print(" | Jumps: "); Serial.print(jumpDetector.getCount());
             Serial.print(" | Stairs: "); Serial.println(stairDetector.getCount());
+            
+            // Send the raw data to the Facade directly. 
+            // The BLE Broadcaster Singleton handles change-detection and TX buffer protection internally.
+            bleFacade.updateTelemetry(currentState, stepDetector.getCount(), jumpDetector.getCount(), stairDetector.getCount()); 
         }
 
         totalSamplesProcessed++;
@@ -196,6 +203,11 @@ MotionState MotionClassifier::update(const MotionData& rawData) {
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\drivers\Mpu6050Sensor.cpp =====
 
+// ========================================================================================================
+// File: Mpu6050Sensor.cpp
+// Purpose: Driver implementation for MPU6050 IMU using the Adafruit library.
+// ========================================================================================================
+
 #include "drivers/Mpu6050Sensor.h"
 #include "params/AlgoParams.hpp"
 #include <Adafruit_MPU6050.h>
@@ -232,16 +244,29 @@ bool Mpu6050Sensor::read(MotionData& out) {
     }
 
     sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp);
+    
+    // Fetch fresh data from the physical I2C sensor
+    if (!mpu.getEvent(&a, &g, &temp)) {
+        ++i2cErrors_;
+        return false;
+    }
 
+    // Convert m/s^2 to standard G units (1G = 9.80665 m/s^2)
     out.accelX = a.acceleration.x / 9.80665f;
     out.accelY = a.acceleration.y / 9.80665f;
     out.accelZ = a.acceleration.z / 9.80665f;
     
+    // Convert radians/s to degrees/s
     out.gyroX = g.gyro.x * 57.2958f;
     out.gyroY = g.gyro.y * 57.2958f;
     out.gyroZ = g.gyro.z * 57.2958f;
     
+    // Assign sequential ID and increment
+    out.sequence = sequence_++;
+    
+    // Timestamp is explicitly handled by the main loop hardware timer
+    out.timestampMs = 0;
+
     return true;
 }
 
@@ -249,7 +274,7 @@ uint32_t Mpu6050Sensor::i2cErrorCount() const {
     return i2cErrors_;
 }
 
-#endif
+#endif // !USE_MOCK_SENSOR
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\hal\SampleTimer.cpp =====
 
@@ -378,6 +403,44 @@ void processMotion(MotionData data)
 {
     // Placeholder for future motion processing logic.
     (void)data;
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\streaming\BLEManager.cpp =====
+
+// ========================================================================================================
+// File: BLEManager.cpp
+// Purpose: Implementation of the BLEManager Facade orchestrating the underlying Singleton components.
+// ========================================================================================================
+
+#include "streaming/BLEManager.h"
+#include "broadcast/BleConnection.hpp"
+#include "broadcast/GattConfigurator.hpp"
+#include "broadcast/DataBroadcaster.hpp"
+#include <Arduino.h>
+
+bool BLEManager::begin() {
+    if (!BleConnection::getInstance().begin()) {
+        Serial.println("[ERROR] BLE radio initialization failed!");
+        return false;
+    }
+
+    GattConfigurator::getInstance().setupServices();
+    BleConnection::getInstance().startAdvertising();
+
+    Serial.println("[INFO] BLE Facade initialized successfully. Advertising...");
+    return true;
+}
+
+void BLEManager::poll() {
+    BleConnection::getInstance().poll();
+}
+
+void BLEManager::updateTelemetry(MotionState state, uint32_t steps, uint32_t jumps, uint32_t stairs) {
+    if (BleConnection::getInstance().isConnected()) {
+        // DataBroadcaster now internally handles state-tracking, subscription validation, and stack polling
+        DataBroadcaster::getInstance().updateState(state);
+        DataBroadcaster::getInstance().updateCounters(steps, jumps, stairs);
+    }
 }
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\streaming\DebugCli.cpp =====
@@ -703,6 +766,221 @@ private:
 
 #endif // MOTION_CLASSIFIER_H
 
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\broadcast\BleConnection.hpp =====
+
+// ========================================================================================================
+// File: BleConnection.hpp
+// Purpose: Singleton class managing the physical BLE radio state, connections, and advertising.
+// ========================================================================================================
+
+#ifndef BLE_CONNECTION_HPP
+#define BLE_CONNECTION_HPP
+
+#include <ArduinoBLE.h>
+#include "config/BLEConfig.hpp"
+
+class BleConnection {
+public:
+    // ----------------------------------------------------------------------------------------------------
+    // Method: getInstance
+    // Purpose: Returns the single, globally accessible instance of the BleConnection class.
+    // ----------------------------------------------------------------------------------------------------
+    static BleConnection& getInstance() {
+        static BleConnection instance;
+        return instance;
+    }
+
+    // Delete copy constructor and assignment operator to enforce Singleton pattern
+    BleConnection(const BleConnection&) = delete;
+    BleConnection& operator=(const BleConnection&) = delete;
+
+    // ----------------------------------------------------------------------------------------------------
+    // Method: begin
+    // Purpose: Initializes the physical BLE module and sets the local device name.
+    // ----------------------------------------------------------------------------------------------------
+    bool begin() {
+        if (!BLE.begin()) {
+            return false;
+        }
+        BLE.setLocalName(BLEConfig::DEVICE_NAME);
+        return true;
+    }
+
+    // ----------------------------------------------------------------------------------------------------
+    // Method: startAdvertising
+    // Purpose: Commands the BLE radio to begin broadcasting its presence to central devices.
+    // ----------------------------------------------------------------------------------------------------
+    void startAdvertising() {
+        BLE.advertise();
+    }
+
+    // ----------------------------------------------------------------------------------------------------
+    // Method: poll
+    // Purpose: Polls the BLE hardware for new connection events and data requests.
+    // ----------------------------------------------------------------------------------------------------
+    void poll() {
+        BLE.poll();
+    }
+
+    // ----------------------------------------------------------------------------------------------------
+    // Method: isConnected
+    // Purpose: Checks if a central device (like a smartphone) is currently connected to the peripheral.
+    // ----------------------------------------------------------------------------------------------------
+    bool isConnected() const {
+        BLEDevice central = BLE.central();
+        return central && central.connected();
+    }
+
+private:
+    // Private constructor to prevent external instantiation
+    BleConnection() = default;
+};
+
+#endif // BLE_CONNECTION_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\broadcast\DataBroadcaster.hpp =====
+
+// ========================================================================================================
+// File: DataBroadcaster.hpp
+// Purpose: Singleton class handling the transmission of telemetry data over the configured BLE characteristics.
+// ========================================================================================================
+
+#ifndef DATA_BROADCASTER_HPP
+#define DATA_BROADCASTER_HPP
+
+#include <cstdint>
+#include "GattConfigurator.hpp"
+#include "BleConnection.hpp"
+#include "params/MotionState.h"
+
+class DataBroadcaster {
+public:
+    static DataBroadcaster& getInstance() {
+        static DataBroadcaster instance;
+        return instance;
+    }
+
+    DataBroadcaster(const DataBroadcaster&) = delete;
+    DataBroadcaster& operator=(const DataBroadcaster&) = delete;
+
+    void updateCounters(uint32_t steps, uint32_t jumps, uint32_t stairs) {
+        // Only write if the value changed AND the client is actively listening
+        if (steps != lastSteps_ && GattConfigurator::getInstance().isStepsSubscribed()) {
+            GattConfigurator::getInstance().getStepsChar().writeValue(steps);
+            lastSteps_ = steps;
+            BleConnection::getInstance().poll(); // Let SoftDevice clear TX buffer
+        }
+        
+        if (jumps != lastJumps_ && GattConfigurator::getInstance().isJumpsSubscribed()) {
+            GattConfigurator::getInstance().getJumpsChar().writeValue(jumps);
+            lastJumps_ = jumps;
+            BleConnection::getInstance().poll();
+        }
+        
+        if (stairs != lastStairs_ && GattConfigurator::getInstance().isStairsSubscribed()) {
+            GattConfigurator::getInstance().getStairsChar().writeValue(stairs);
+            lastStairs_ = stairs;
+            BleConnection::getInstance().poll();
+        }
+    }
+
+    void updateState(MotionState state) {
+        if (state != lastState_ && GattConfigurator::getInstance().isStateSubscribed()) {
+            GattConfigurator::getInstance().getStateChar().writeValue(static_cast<uint8_t>(state));
+            lastState_ = state;
+            BleConnection::getInstance().poll();
+        }
+    }
+
+private:
+    DataBroadcaster() = default;
+
+    // Internal state tracking to prevent redundant BLE notifications
+    uint32_t lastSteps_ = 0;
+    uint32_t lastJumps_ = 0;
+    uint32_t lastStairs_ = 0;
+    MotionState lastState_ = MotionState::IDLE;
+};
+
+#endif // DATA_BROADCASTER_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\broadcast\GattConfigurator.hpp =====
+
+// ========================================================================================================
+// File: GattConfigurator.hpp
+// Purpose: Singleton class responsible for defining and registering the BLE GATT services and characteristics.
+// ========================================================================================================
+
+#ifndef GATT_CONFIGURATOR_HPP
+#define GATT_CONFIGURATOR_HPP
+
+#include <ArduinoBLE.h>
+#include "config/BLEConfig.hpp"
+#include "params/MotionState.h"
+
+class GattConfigurator {
+public:
+    static GattConfigurator& getInstance() {
+        static GattConfigurator instance;
+        return instance;
+    }
+
+    GattConfigurator(const GattConfigurator&) = delete;
+    GattConfigurator& operator=(const GattConfigurator&) = delete;
+
+    void setupServices() {
+        BLE.setAdvertisedService(stepMasterService_);
+        
+        stepMasterService_.addCharacteristic(stepsChar_);
+        stepMasterService_.addCharacteristic(jumpsChar_);
+        stepMasterService_.addCharacteristic(stairsChar_);
+        stepMasterService_.addCharacteristic(stateChar_);
+        
+        BLE.addService(stepMasterService_);
+
+        batteryService_.addCharacteristic(batteryLevelChar_);
+        BLE.addService(batteryService_);
+
+        stepsChar_.writeValue(0);
+        jumpsChar_.writeValue(0);
+        stairsChar_.writeValue(0);
+        stateChar_.writeValue(static_cast<uint8_t>(MotionState::IDLE));
+        batteryLevelChar_.writeValue(100);
+    }
+
+    BLEUnsignedIntCharacteristic& getStepsChar() { return stepsChar_; }
+    BLEUnsignedIntCharacteristic& getJumpsChar() { return jumpsChar_; }
+    BLEUnsignedIntCharacteristic& getStairsChar() { return stairsChar_; }
+    BLEByteCharacteristic& getStateChar() { return stateChar_; }
+
+    // Check if the central device is actually subscribed to notifications
+    bool isStepsSubscribed() { return stepsChar_.subscribed(); }
+    bool isJumpsSubscribed() { return jumpsChar_.subscribed(); }
+    bool isStairsSubscribed() { return stairsChar_.subscribed(); }
+    bool isStateSubscribed() { return stateChar_.subscribed(); }
+
+private:
+    GattConfigurator() : 
+        stepMasterService_(BLEConfig::SERVICE_UUID),
+        stepsChar_(BLEConfig::CHAR_STEPS_UUID, BLERead | BLENotify),
+        jumpsChar_(BLEConfig::CHAR_JUMPS_UUID, BLERead | BLENotify),
+        stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify),
+        stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify),
+        batteryService_(BLEConfig::BATTERY_SERVICE_UUID),
+        batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify) {}
+
+    BLEService stepMasterService_;
+    BLEUnsignedIntCharacteristic stepsChar_;
+    BLEUnsignedIntCharacteristic jumpsChar_;
+    BLEUnsignedIntCharacteristic stairsChar_;
+    BLEByteCharacteristic stateChar_;
+    
+    BLEService batteryService_;
+    BLEUnsignedCharCharacteristic batteryLevelChar_;
+};
+
+#endif // GATT_CONFIGURATOR_HPP
+
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\buffers\RingBuffer.hpp =====
 
 #ifndef RING_BUFFER_HPP
@@ -792,6 +1070,47 @@ private:
 };
 
 #endif
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\config\BLEConfig.hpp =====
+
+// ========================================================================================================
+// File: BLEConfig.hpp
+// Purpose: Defines UUIDs and configuration parameters for the StepMaster BLE GATT Services.
+// ========================================================================================================
+
+#ifndef BLE_CONFIG_HPP
+#define BLE_CONFIG_HPP
+
+namespace BLEConfig {
+    // Device Name as it will appear in Bluetooth scans
+    constexpr const char* DEVICE_NAME = "StepMaster_XIAO";
+
+    // ----------------------------------------------------------------------------------------------------
+    // Custom StepMaster Service UUIDs
+    // ----------------------------------------------------------------------------------------------------
+    // Primary Service UUID for StepMaster telemetry
+    constexpr const char* SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0";
+    
+    // Characteristic UUID for transmitting total steps
+    constexpr const char* CHAR_STEPS_UUID = "12345678-1234-5678-1234-56789abcdef1";
+    
+    // Characteristic UUID for transmitting total jumps
+    constexpr const char* CHAR_JUMPS_UUID = "12345678-1234-5678-1234-56789abcdef2";
+    
+    // Characteristic UUID for transmitting total stairs
+    constexpr const char* CHAR_STAIRS_UUID = "12345678-1234-5678-1234-56789abcdef3";
+    
+    // Characteristic UUID for transmitting the current motion state
+    constexpr const char* CHAR_STATE_UUID = "12345678-1234-5678-1234-56789abcdef4";
+
+    // ----------------------------------------------------------------------------------------------------
+    // Standard SIG Battery Service UUIDs
+    // ----------------------------------------------------------------------------------------------------
+    constexpr const char* BATTERY_SERVICE_UUID = "180F";
+    constexpr const char* BATTERY_LEVEL_CHAR_UUID = "2A19";
+}
+
+#endif // BLE_CONFIG_HPP
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\config\HardwareConfig.hpp =====
 
@@ -1013,13 +1332,17 @@ private:
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\drivers\Mpu6050Sensor.h =====
 
+// ========================================================================================================
+// File: Mpu6050Sensor.h
+// Purpose: Concrete motion sensor implementation for the MPU6050 IMU.
+// ========================================================================================================
+
 #ifndef MPU6050_SENSOR_H
 #define MPU6050_SENSOR_H
 
 #include "sensors/MotionSensor.h"
 
 #if !USE_MOCK_SENSOR
-/// Concrete motion sensor implementation for the MPU6050 IMU.
 class Mpu6050Sensor : public MotionSensor
 {
 public:
@@ -1029,10 +1352,11 @@ public:
 
 private:
     uint32_t i2cErrors_ = 0;
+    uint32_t sequence_ = 0; // Tracks the absolute number of physical samples read
     bool ready_ = false;
 };
-#endif
-#endif
+#endif // !USE_MOCK_SENSOR
+#endif // MPU6050_SENSOR_H
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\filter\EmaFilter.hpp =====
 
@@ -1252,6 +1576,42 @@ public:
 
 #endif // MOTION_SENSOR_H
 
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\streaming\BLEManager.h =====
+
+// ========================================================================================================
+// File: BLEManager.h
+// Purpose: Facade class providing a simplified interface to the BLE subsystems (Connection, GATT, Broadcast).
+// ========================================================================================================
+
+#ifndef BLE_MANAGER_H
+#define BLE_MANAGER_H
+
+#include <cstdint>
+#include "params/MotionState.h"
+
+class BLEManager {
+public:
+    // ----------------------------------------------------------------------------------------------------
+    // Method: begin
+    // Purpose: Orchestrates the initialization of the BLE hardware, GATT configuration, and starts advertising.
+    // ----------------------------------------------------------------------------------------------------
+    bool begin();
+
+    // ----------------------------------------------------------------------------------------------------
+    // Method: poll
+    // Purpose: Delegates polling execution to the underlying BLE connection manager to handle radio events.
+    // ----------------------------------------------------------------------------------------------------
+    void poll();
+
+    // ----------------------------------------------------------------------------------------------------
+    // Method: updateTelemetry
+    // Purpose: Transmits motion state and updated counter values to connected central devices if a link exists.
+    // ----------------------------------------------------------------------------------------------------
+    void updateTelemetry(MotionState state, uint32_t steps, uint32_t jumps, uint32_t stairs);
+};
+
+#endif // BLE_MANAGER_H
+
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\streaming\DebugCli.h =====
 
 #ifndef DEBUG_CLI_H
@@ -1383,6 +1743,196 @@ private:
 };
 
 #endif // SLIDING_WINDOW_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_broadcast\test_ble_services.cpp =====
+
+// ========================================================================================================
+// File: test_ble_services.cpp
+// Purpose: Validates the BLE Manager Facade, Singleton instantiation, and GATT Characteristic updates.
+// ========================================================================================================
+
+#include <Arduino.h>
+#include <unity.h>
+
+#include "streaming/BLEManager.h"
+#include "broadcast/GattConfigurator.hpp"
+#include "broadcast/DataBroadcaster.hpp"
+#include "broadcast/BleConnection.hpp"
+
+BLEManager bleManager;
+
+void setUp(void) {
+    // No per-test setup required.
+}
+
+void tearDown(void) {
+    // No per-test teardown required.
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test 1: Verify the physical BLE radio and Facade orchestrator initialize without errors.
+// ----------------------------------------------------------------------------------------------------
+void test_ble_initialization(void) {
+    bool initSuccess = bleManager.begin();
+    TEST_ASSERT_TRUE_MESSAGE(initSuccess, "BLE Manager failed to initialize. Check hardware radio module.");
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test 2: Ensure GATT Characteristics are correctly booted with safe default values (zeros).
+// ----------------------------------------------------------------------------------------------------
+void test_gatt_default_values(void) {
+    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value();
+    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value();
+    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value();
+    uint8_t state = GattConfigurator::getInstance().getStateChar().value();
+
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, steps, "Initial step count should be 0");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, jumps, "Initial jump count should be 0");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, stairs, "Initial stair count should be 0");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(static_cast<uint8_t>(MotionState::IDLE), state, "Initial state should be IDLE");
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test 3: Validate the DataBroadcaster Singleton successfully routes data to the GATT memory.
+// ----------------------------------------------------------------------------------------------------
+void test_broadcaster_updates_characteristics(void) {
+    // Simulate a motion event pushing data to the broadcaster
+    DataBroadcaster::getInstance().updateCounters(150, 5, 12);
+    DataBroadcaster::getInstance().updateState(MotionState::STEP);
+
+    // Read back directly from the GATT server characteristics
+    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value();
+    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value();
+    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value();
+    uint8_t state = GattConfigurator::getInstance().getStateChar().value();
+
+    TEST_ASSERT_EQUAL_UINT32(150, steps);
+    TEST_ASSERT_EQUAL_UINT32(5, jumps);
+    TEST_ASSERT_EQUAL_UINT32(12, stairs);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MotionState::STEP), state);
+}
+
+void setup() {
+    delay(2000); // Allow hardware radio and serial port to stabilize
+    UNITY_BEGIN();
+    
+    RUN_TEST(test_ble_initialization);
+    RUN_TEST(test_gatt_default_values);
+    RUN_TEST(test_broadcaster_updates_characteristics);
+    
+    UNITY_END();
+    delay(1000); // Ensure serial buffer flushes before reset
+}
+
+void loop() {
+    // Unity test framework requires an empty loop
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_broadcast\test_broadcaster_stress_endurance.cpp =====
+
+// ========================================================================================================
+// File: test_ble_services.cpp
+// Purpose: Validates the BLE Manager Facade, Singleton instantiation, GATT Characteristic updates,
+// and extreme stress testing of the telemetry broadcaster to prevent radio stack buffer overflows.
+// ========================================================================================================
+
+#include <Arduino.h>
+#include <unity.h>
+
+#include "streaming/BLEManager.h"
+#include "broadcast/GattConfigurator.hpp"
+#include "broadcast/DataBroadcaster.hpp"
+#include "broadcast/BleConnection.hpp"
+
+BLEManager bleManager;
+
+void setUp(void) {
+    // No per-test setup required.
+}
+
+void tearDown(void) {
+    // No per-test teardown required.
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test 1: Verify the physical BLE radio and Facade orchestrator initialize without errors.
+// ----------------------------------------------------------------------------------------------------
+void test_ble_initialization(void) {
+    bool initSuccess = bleManager.begin();
+    TEST_ASSERT_TRUE_MESSAGE(initSuccess, "BLE Manager failed to initialize. Check hardware radio module.");
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test 2: Ensure GATT Characteristics are correctly booted with safe default values (zeros).
+// ----------------------------------------------------------------------------------------------------
+void test_gatt_default_values(void) {
+    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value();
+    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value();
+    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value();
+    uint8_t state = GattConfigurator::getInstance().getStateChar().value();
+
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, steps, "Initial step count should be 0");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, jumps, "Initial jump count should be 0");
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, stairs, "Initial stair count should be 0");
+    TEST_ASSERT_EQUAL_UINT8_MESSAGE(static_cast<uint8_t>(MotionState::IDLE), state, "Initial state should be IDLE");
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test 3: Validate the DataBroadcaster Singleton successfully routes data to the GATT memory.
+// ----------------------------------------------------------------------------------------------------
+void test_broadcaster_updates_characteristics(void) {
+    // Simulate a motion event pushing data to the broadcaster
+    DataBroadcaster::getInstance().updateCounters(150, 5, 12);
+    DataBroadcaster::getInstance().updateState(MotionState::STEP);
+
+    // Read back directly from the GATT server characteristics
+    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value();
+    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value();
+    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value();
+    uint8_t state = GattConfigurator::getInstance().getStateChar().value();
+
+    TEST_ASSERT_EQUAL_UINT32(150, steps);
+    TEST_ASSERT_EQUAL_UINT32(5, jumps);
+    TEST_ASSERT_EQUAL_UINT32(12, stairs);
+    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MotionState::STEP), state);
+}
+
+// ----------------------------------------------------------------------------------------------------
+// Test 4: Radio Buffer Stress Test - Pumping 10,000 rapid updates into the BLE Stack
+// Purpose: Ensures the BLE Stack does not suffer from buffer overflow or hard faults during extreme
+// continuous physical activity.
+// ----------------------------------------------------------------------------------------------------
+void test_broadcaster_stress_endurance(void) {
+    // Attempt 10,000 rapid characteristic writes, simulating heavy activity
+    for (uint32_t i = 1; i <= 10000; i++) {
+        DataBroadcaster::getInstance().updateCounters(i, 0, 0);
+        // Force the BLE stack to process the queued internal events
+        bleManager.poll();
+    }
+
+    // Retrieve the final state directly from the GATT structure
+    uint32_t finalSteps = GattConfigurator::getInstance().getStepsChar().value();
+
+    // Verify 100% data integrity post-stress
+    TEST_ASSERT_EQUAL_UINT32_MESSAGE(10000, finalSteps, "BLE Broadcaster dropped packets during stress execution.");
+}
+
+void setup() {
+    delay(2000); // Allow hardware radio and serial port to stabilize
+    UNITY_BEGIN();
+    
+    RUN_TEST(test_ble_initialization);
+    RUN_TEST(test_gatt_default_values);
+    RUN_TEST(test_broadcaster_updates_characteristics);
+    RUN_TEST(test_broadcaster_stress_endurance); // Execute the new stress test
+    
+    UNITY_END();
+    delay(1000); // Ensure serial buffer flushes before reset
+}
+
+void loop() {
+    // Unity test framework requires an empty loop
+}
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_hardware_sensor\test_hardware_sensor.cpp =====
 
