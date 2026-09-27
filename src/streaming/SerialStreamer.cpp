@@ -1,7 +1,7 @@
 #include "streaming/SerialStreamer.h"
 
-#include "AlgoParams.hpp"
-#include "BuildFlags.h"
+#include "params/AlgoParams.hpp"
+#include "params/BuildFlags.h"
 #include "hal/SampleTimer.h"
 
 #include <Arduino.h>
@@ -23,28 +23,28 @@ bool SerialStreamer::enabled() const
 }
 
 void SerialStreamer::streamSample(const RawSample& sample)
+{
+#if ENABLE_STREAMING
+    if (!enabled_)
     {
-    #if ENABLE_STREAMING
-        if (!enabled_)
-        {
-            return;
-        }
-
-        // Teleplot Format: >VariableName:Value
-        // Stream accelerometer axes
-        Serial.print(F(">Accel_X:"));
-        Serial.println(sample.ax, STREAM_DECIMAL_PLACES);
-        Serial.print(F(">Accel_Y:"));
-        Serial.println(sample.ay, STREAM_DECIMAL_PLACES);
-        Serial.print(F(">Accel_Z:"));
-        Serial.println(sample.az, STREAM_DECIMAL_PLACES);
-
-        // Stream gyroscope axes
-        Serial.print(F(">Gyro_X:")); Serial.println(sample.gx, STREAM_DECIMAL_PLACES);
-        Serial.print(F(">Gyro_Y:")); Serial.println(sample.gy, STREAM_DECIMAL_PLACES);
-        Serial.print(F(">Gyro_Z:")); Serial.println(sample.gz, STREAM_DECIMAL_PLACES);
-    #endif
+        return;
     }
+
+    // Teleplot Format: >VariableName:Value
+    // Stream accelerometer axes
+    Serial.print(F(">Accel_X:"));
+    Serial.println(sample.ax, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Accel_Y:"));
+    Serial.println(sample.ay, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Accel_Z:"));
+    Serial.println(sample.az, STREAM_DECIMAL_PLACES);
+
+    // Stream gyroscope axes
+    Serial.print(F(">Gyro_X:")); Serial.println(sample.gx, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Gyro_Y:")); Serial.println(sample.gy, STREAM_DECIMAL_PLACES);
+    Serial.print(F(">Gyro_Z:")); Serial.println(sample.gz, STREAM_DECIMAL_PLACES);
+#endif
+}
 
 void SerialStreamer::maybePrintStats(uint32_t& samplesSinceLastStat, uint32_t i2cErrors)
 {

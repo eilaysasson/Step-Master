@@ -1,4 +1,4 @@
-#include "MockSensor.h"
+#include "sensors/MockSensor.h"
 #include <Arduino.h>
 #include <cmath>
 
@@ -27,7 +27,6 @@ public:
 
         out.sequence = 0;
         out.timestampMs = millis();
-        out.isStep = false;
 
         return true;
     }
