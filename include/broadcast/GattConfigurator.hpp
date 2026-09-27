@@ -22,7 +22,12 @@ public:
 
     void setupServices() {
         BLE.setAdvertisedService(stepMasterService_);
-        
+
+        stepsChar_.addDescriptor(stepsNameDescriptor_);
+        jumpsChar_.addDescriptor(jumpsNameDescriptor_);
+        stairsChar_.addDescriptor(stairsNameDescriptor_);
+        stateChar_.addDescriptor(stateNameDescriptor_);
+
         stepMasterService_.addCharacteristic(stepsChar_);
         stepMasterService_.addCharacteristic(jumpsChar_);
         stepMasterService_.addCharacteristic(stairsChar_);
@@ -59,13 +64,22 @@ private:
         stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify),
         stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify),
         batteryService_(BLEConfig::BATTERY_SERVICE_UUID),
-        batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify) {}
+        batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify),
+        stepsNameDescriptor_("2901", "Step Count"),
+        jumpsNameDescriptor_("2901", "Jump Count"),
+        stairsNameDescriptor_("2901", "Stair Count"),
+        stateNameDescriptor_("2901", "Motion State") {}
 
     BLEService stepMasterService_;
     BLEUnsignedIntCharacteristic stepsChar_;
     BLEUnsignedIntCharacteristic jumpsChar_;
     BLEUnsignedIntCharacteristic stairsChar_;
     BLEByteCharacteristic stateChar_;
+
+    BLEDescriptor stepsNameDescriptor_;
+    BLEDescriptor jumpsNameDescriptor_;
+    BLEDescriptor stairsNameDescriptor_;
+    BLEDescriptor stateNameDescriptor_;
     
     BLEService batteryService_;
     BLEUnsignedCharCharacteristic batteryLevelChar_;
