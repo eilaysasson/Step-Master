@@ -1,3 +1,5 @@
+//===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\algorithem\MotionClassifier.cpp =====
+
 #include "algorithem/MotionClassifier.h"
 #include "params/AlgoParams.hpp"
 #include <cmath>

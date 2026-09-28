@@ -3,53 +3,42 @@
 
 #include "detectors/BaseMotion.hpp"
 #include "params/AlgoParams.hpp"
-
-enum class JumpFsmState { NORMAL, FLIGHT };
+#include "utils/PeakDetector.hpp"
+#include <cmath>
+#include <algorithm>
 
 class JumpMotion : public BaseMotion {
 public:
-    JumpMotion() : BaseMotion(MotionState::JUMP), jumpState_(JumpFsmState::NORMAL),
-                   flightStartMs_(0), consecutiveFlightExitSamples_(0) {}
+    JumpMotion() : BaseMotion(MotionState::JUMP), stepRefractoryEndMs_(0) {}
 
 protected:
     bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
-        if (jumpState_ == JumpFsmState::NORMAL) {
-            if (features.rawMag < AlgoParams::FLIGHT_ENTER_G) {
-                jumpState_ = JumpFsmState::FLIGHT;
-                flightStartMs_ = features.timestampMs;
-                consecutiveFlightExitSamples_ = 0;
-            }
-        } else if (jumpState_ == JumpFsmState::FLIGHT) {
-            if (features.timestampMs - flightStartMs_ > AlgoParams::FLIGHT_MAX_DURATION_MS) {
-                jumpState_ = JumpFsmState::NORMAL;
-                consecutiveFlightExitSamples_ = 0;
-            }
-        }
-        return (jumpState_ == JumpFsmState::FLIGHT);
+        return true;
     }
 
     bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
-        if (features.rawMag > AlgoParams::FLIGHT_EXIT_G) {
-            consecutiveFlightExitSamples_++;
-            
-            if (consecutiveFlightExitSamples_ >= AlgoParams::JUMP_CONSECUTIVE_FRAMES) {
-                uint32_t flightDuration = features.timestampMs - flightStartMs_;
-                jumpState_ = JumpFsmState::NORMAL;
+        float peakValue = 0.0f;
+        bool isPeak = peakDetector_.update(features.smoothMag, peakValue);
 
-                if (flightDuration >= AlgoParams::FLIGHT_MIN_DURATION_MS && flightDuration <= AlgoParams::FLIGHT_MAX_DURATION_MS) {
-                    return true;
-                }
+        if (isPeak) {
+            if (features.timestampMs < stepRefractoryEndMs_) return false;
+
+            float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
+            float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
+
+            // Absolute maximum rotation targets (Knees to chest, ballet high kicks, extreme impact leaps).
+            float absPitch = std::fabs(features.pitchAngle);
+            if (peakValue > clampedThreshold && absPitch >= AlgoParams::PITCH_THRESHOLD_JUMP) {
+                stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
+                return true;
             }
-        } else {
-            consecutiveFlightExitSamples_ = 0;
         }
         return false;
     }
 
 private:
-    JumpFsmState jumpState_;
-    uint32_t flightStartMs_;
-    uint32_t consecutiveFlightExitSamples_;
+    uint32_t stepRefractoryEndMs_;
+    PeakDetector peakDetector_;
 };
 
 #endif // JUMP_MOTION_HPP

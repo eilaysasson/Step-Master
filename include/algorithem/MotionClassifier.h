@@ -1,3 +1,5 @@
+//===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\algorithem\MotionClassifier.h =====
+
 #ifndef MOTION_CLASSIFIER_H
 #define MOTION_CLASSIFIER_H
 

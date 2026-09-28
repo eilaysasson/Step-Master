@@ -1,3 +1,8 @@
+// ========================================================================================================
+// File: include/params/AlgoParams.hpp
+// Purpose: Defines system-wide configuration constants for hardware, signal processing, and algorithms.
+// ========================================================================================================
+
 #ifndef ALGO_PARAMS_HPP
 #define ALGO_PARAMS_HPP
 
@@ -22,20 +27,15 @@ namespace AlgoParams {
 
     constexpr std::size_t SLIDING_WINDOW_SIZE = 100;
 
-    constexpr uint32_t STEP_REFRACTORY_MS = 120;
+    // --- Unified Kinematics (Pitch-Based Separation) ---
+    constexpr uint32_t STEP_REFRACTORY_MS = 250;
     constexpr float STEP_THRESHOLD_MIN_G = 1.15f;
     constexpr float STEP_THRESHOLD_MAX_G = 1.90f;
     constexpr float STEP_K_FACTOR = 1.5f;
 
-    constexpr float FLIGHT_ENTER_G = 0.35f;
-    constexpr float FLIGHT_EXIT_G = 0.70f;
-    constexpr uint32_t FLIGHT_MIN_DURATION_MS = 180;
-    constexpr uint32_t FLIGHT_MAX_DURATION_MS = 850;
-    constexpr uint32_t JUMP_CONSECUTIVE_FRAMES = 3;
-
-    constexpr float STAIR_ENERGY_THRESHOLD = 0.45f;
-    constexpr float STAIR_PITCH_THRESHOLD = 35.0f;
-    constexpr uint32_t STAIR_CONSECUTIVE_FRAMES = 3;
+    // Pitch boundaries to strictly enforce mutual exclusion (no double counting).
+    constexpr float PITCH_THRESHOLD_STAIRS = 25.0f; // Angles >= 25 but < 65 classify as stairs.
+    constexpr float PITCH_THRESHOLD_JUMP = 65.0f;   // Angles >= 65 classify as jumps (knees-to-chest/high kicks).
 }
 
 #endif // ALGO_PARAMS_HPP

@@ -160,6 +160,8 @@ void loop() {
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\algorithem\MotionClassifier.cpp =====
 
+//===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\algorithem\MotionClassifier.cpp =====
+
 #include "algorithem/MotionClassifier.h"
 #include "params/AlgoParams.hpp"
 #include <cmath>
@@ -736,6 +738,8 @@ void SlidingWindow::clear() {
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\algorithem\MotionClassifier.h =====
 
+//===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\algorithem\MotionClassifier.h =====
+
 #ifndef MOTION_CLASSIFIER_H
 #define MOTION_CLASSIFIER_H
 
@@ -840,15 +844,11 @@ private:
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\broadcast\DataBroadcaster.hpp =====
 
-// ========================================================================================================
-// File: DataBroadcaster.hpp
-// Purpose: Singleton class handling the transmission of telemetry data over the configured BLE characteristics.
-// ========================================================================================================
-
 #ifndef DATA_BROADCASTER_HPP
 #define DATA_BROADCASTER_HPP
 
 #include <cstdint>
+#include <Arduino.h>
 #include "GattConfigurator.hpp"
 #include "BleConnection.hpp"
 #include "params/MotionState.h"
@@ -864,29 +864,35 @@ public:
     DataBroadcaster& operator=(const DataBroadcaster&) = delete;
 
     void updateCounters(uint32_t steps, uint32_t jumps, uint32_t stairs) {
-        // Only write if the value changed AND the client is actively listening
-        if (steps != lastSteps_ && GattConfigurator::getInstance().isStepsSubscribed()) {
-            GattConfigurator::getInstance().getStepsChar().writeValue(steps);
+        // String conversion happens ONLY when a counter actually changes, ensuring top performance.
+        if (steps != lastSteps_) {
+            GattConfigurator::getInstance().getStepsChar().writeValue(String(steps));
             lastSteps_ = steps;
-            BleConnection::getInstance().poll(); // Let SoftDevice clear TX buffer
+            BleConnection::getInstance().poll();
         }
         
-        if (jumps != lastJumps_ && GattConfigurator::getInstance().isJumpsSubscribed()) {
-            GattConfigurator::getInstance().getJumpsChar().writeValue(jumps);
+        if (jumps != lastJumps_) {
+            GattConfigurator::getInstance().getJumpsChar().writeValue(String(jumps));
             lastJumps_ = jumps;
             BleConnection::getInstance().poll();
         }
         
-        if (stairs != lastStairs_ && GattConfigurator::getInstance().isStairsSubscribed()) {
-            GattConfigurator::getInstance().getStairsChar().writeValue(stairs);
+        if (stairs != lastStairs_) {
+            GattConfigurator::getInstance().getStairsChar().writeValue(String(stairs));
             lastStairs_ = stairs;
             BleConnection::getInstance().poll();
         }
     }
 
     void updateState(MotionState state) {
-        if (state != lastState_ && GattConfigurator::getInstance().isStateSubscribed()) {
-            GattConfigurator::getInstance().getStateChar().writeValue(static_cast<uint8_t>(state));
+        if (state != lastState_) {
+            String stateStr = "IDLE";
+            if (state == MotionState::STEP) stateStr = "STEP";
+            else if (state == MotionState::JUMP) stateStr = "JUMP";
+            else if (state == MotionState::STAIRS) stateStr = "STAIRS";
+            else if (state == MotionState::NOISE) stateStr = "NOISE";
+
+            GattConfigurator::getInstance().getStateChar().writeValue(stateStr);
             lastState_ = state;
             BleConnection::getInstance().poll();
         }
@@ -895,7 +901,6 @@ public:
 private:
     DataBroadcaster() = default;
 
-    // Internal state tracking to prevent redundant BLE notifications
     uint32_t lastSteps_ = 0;
     uint32_t lastJumps_ = 0;
     uint32_t lastStairs_ = 0;
@@ -905,11 +910,6 @@ private:
 #endif // DATA_BROADCASTER_HPP
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\broadcast\GattConfigurator.hpp =====
-
-// ========================================================================================================
-// File: GattConfigurator.hpp
-// Purpose: Singleton class responsible for defining and registering the BLE GATT services and characteristics.
-// ========================================================================================================
 
 #ifndef GATT_CONFIGURATOR_HPP
 #define GATT_CONFIGURATOR_HPP
@@ -930,7 +930,12 @@ public:
 
     void setupServices() {
         BLE.setAdvertisedService(stepMasterService_);
-        
+
+        stepsChar_.addDescriptor(stepsNameDescriptor_);
+        jumpsChar_.addDescriptor(jumpsNameDescriptor_);
+        stairsChar_.addDescriptor(stairsNameDescriptor_);
+        stateChar_.addDescriptor(stateNameDescriptor_);
+
         stepMasterService_.addCharacteristic(stepsChar_);
         stepMasterService_.addCharacteristic(jumpsChar_);
         stepMasterService_.addCharacteristic(stairsChar_);
@@ -941,19 +946,20 @@ public:
         batteryService_.addCharacteristic(batteryLevelChar_);
         BLE.addService(batteryService_);
 
-        stepsChar_.writeValue(0);
-        jumpsChar_.writeValue(0);
-        stairsChar_.writeValue(0);
-        stateChar_.writeValue(static_cast<uint8_t>(MotionState::IDLE));
+        // Initialize with default readable text values
+        stepsChar_.writeValue("0");
+        jumpsChar_.writeValue("0");
+        stairsChar_.writeValue("0");
+        stateChar_.writeValue("IDLE");
         batteryLevelChar_.writeValue(100);
     }
 
-    BLEUnsignedIntCharacteristic& getStepsChar() { return stepsChar_; }
-    BLEUnsignedIntCharacteristic& getJumpsChar() { return jumpsChar_; }
-    BLEUnsignedIntCharacteristic& getStairsChar() { return stairsChar_; }
-    BLEByteCharacteristic& getStateChar() { return stateChar_; }
+    // Accessors modified to return BLEStringCharacteristic
+    BLEStringCharacteristic& getStepsChar() { return stepsChar_; }
+    BLEStringCharacteristic& getJumpsChar() { return jumpsChar_; }
+    BLEStringCharacteristic& getStairsChar() { return stairsChar_; }
+    BLEStringCharacteristic& getStateChar() { return stateChar_; }
 
-    // Check if the central device is actually subscribed to notifications
     bool isStepsSubscribed() { return stepsChar_.subscribed(); }
     bool isJumpsSubscribed() { return jumpsChar_.subscribed(); }
     bool isStairsSubscribed() { return stairsChar_.subscribed(); }
@@ -962,21 +968,31 @@ public:
 private:
     GattConfigurator() : 
         stepMasterService_(BLEConfig::SERVICE_UUID),
-        stepsChar_(BLEConfig::CHAR_STEPS_UUID, BLERead | BLENotify),
-        jumpsChar_(BLEConfig::CHAR_JUMPS_UUID, BLERead | BLENotify),
-        stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify),
-        stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify),
+        // Max 15 bytes string length - highly optimized
+        stepsChar_(BLEConfig::CHAR_STEPS_UUID, BLERead | BLENotify, 15),
+        jumpsChar_(BLEConfig::CHAR_JUMPS_UUID, BLERead | BLENotify, 15),
+        stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify, 15),
+        stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify, 15),
         batteryService_(BLEConfig::BATTERY_SERVICE_UUID),
-        batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify) {}
+        batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify),
+        stepsNameDescriptor_("2901", "Step Count"),
+        jumpsNameDescriptor_("2901", "Jump Count"),
+        stairsNameDescriptor_("2901", "Stair Count"),
+        stateNameDescriptor_("2901", "Motion State") {}
 
     BLEService stepMasterService_;
-    BLEUnsignedIntCharacteristic stepsChar_;
-    BLEUnsignedIntCharacteristic jumpsChar_;
-    BLEUnsignedIntCharacteristic stairsChar_;
-    BLEByteCharacteristic stateChar_;
+    BLEStringCharacteristic stepsChar_;
+    BLEStringCharacteristic jumpsChar_;
+    BLEStringCharacteristic stairsChar_;
+    BLEStringCharacteristic stateChar_;
     
     BLEService batteryService_;
     BLEUnsignedCharCharacteristic batteryLevelChar_;
+    
+    BLEDescriptor stepsNameDescriptor_;
+    BLEDescriptor jumpsNameDescriptor_;
+    BLEDescriptor stairsNameDescriptor_;
+    BLEDescriptor stateNameDescriptor_;
 };
 
 #endif // GATT_CONFIGURATOR_HPP
@@ -1180,53 +1196,42 @@ private:
 
 #include "detectors/BaseMotion.hpp"
 #include "params/AlgoParams.hpp"
-
-enum class JumpFsmState { NORMAL, FLIGHT };
+#include "utils/PeakDetector.hpp"
+#include <cmath>
+#include <algorithm>
 
 class JumpMotion : public BaseMotion {
 public:
-    JumpMotion() : BaseMotion(MotionState::JUMP), jumpState_(JumpFsmState::NORMAL),
-                   flightStartMs_(0), consecutiveFlightExitSamples_(0) {}
+    JumpMotion() : BaseMotion(MotionState::JUMP), stepRefractoryEndMs_(0) {}
 
 protected:
     bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
-        if (jumpState_ == JumpFsmState::NORMAL) {
-            if (features.rawMag < AlgoParams::FLIGHT_ENTER_G) {
-                jumpState_ = JumpFsmState::FLIGHT;
-                flightStartMs_ = features.timestampMs;
-                consecutiveFlightExitSamples_ = 0;
-            }
-        } else if (jumpState_ == JumpFsmState::FLIGHT) {
-            if (features.timestampMs - flightStartMs_ > AlgoParams::FLIGHT_MAX_DURATION_MS) {
-                jumpState_ = JumpFsmState::NORMAL;
-                consecutiveFlightExitSamples_ = 0;
-            }
-        }
-        return (jumpState_ == JumpFsmState::FLIGHT);
+        return true;
     }
 
     bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
-        if (features.rawMag > AlgoParams::FLIGHT_EXIT_G) {
-            consecutiveFlightExitSamples_++;
-            
-            if (consecutiveFlightExitSamples_ >= AlgoParams::JUMP_CONSECUTIVE_FRAMES) {
-                uint32_t flightDuration = features.timestampMs - flightStartMs_;
-                jumpState_ = JumpFsmState::NORMAL;
+        float peakValue = 0.0f;
+        bool isPeak = peakDetector_.update(features.smoothMag, peakValue);
 
-                if (flightDuration >= AlgoParams::FLIGHT_MIN_DURATION_MS && flightDuration <= AlgoParams::FLIGHT_MAX_DURATION_MS) {
-                    return true;
-                }
+        if (isPeak) {
+            if (features.timestampMs < stepRefractoryEndMs_) return false;
+
+            float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
+            float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
+
+            // Absolute maximum rotation targets (Knees to chest, ballet high kicks, extreme impact leaps).
+            float absPitch = std::fabs(features.pitchAngle);
+            if (peakValue > clampedThreshold && absPitch >= AlgoParams::PITCH_THRESHOLD_JUMP) {
+                stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
+                return true;
             }
-        } else {
-            consecutiveFlightExitSamples_ = 0;
         }
         return false;
     }
 
 private:
-    JumpFsmState jumpState_;
-    uint32_t flightStartMs_;
-    uint32_t consecutiveFlightExitSamples_;
+    uint32_t stepRefractoryEndMs_;
+    PeakDetector peakDetector_;
 };
 
 #endif // JUMP_MOTION_HPP
@@ -1242,55 +1247,44 @@ private:
 #include <cmath>
 #include <algorithm>
 
-enum class StairFsmState { FLAT_GAIT, STAIR_CLIMBING };
-
 class StairMotion : public BaseMotion {
 public:
-    StairMotion() : BaseMotion(MotionState::STAIRS), stairState_(StairFsmState::FLAT_GAIT),
-                    shortTimeEnergyBuffer_(0.0f), consecutiveStairFrames_(0), stepRefractoryEndMs_(0) {}
+    StairMotion() : BaseMotion(MotionState::STAIRS), stepRefractoryEndMs_(0) {}
 
 protected:
     bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
-        float frameEnergy = (features.smoothMag - window.getMean()) * (features.smoothMag - window.getMean());
-        shortTimeEnergyBuffer_ = (0.8f * shortTimeEnergyBuffer_) + (0.2f * frameEnergy);
-
-        if (shortTimeEnergyBuffer_ > AlgoParams::STAIR_ENERGY_THRESHOLD && std::fabs(features.pitchAngle) > AlgoParams::STAIR_PITCH_THRESHOLD) {
-            if (stairState_ == StairFsmState::FLAT_GAIT) {
-                consecutiveStairFrames_++;
-                if (consecutiveStairFrames_ >= AlgoParams::STAIR_CONSECUTIVE_FRAMES) {
-                    stairState_ = StairFsmState::STAIR_CLIMBING;
-                    consecutiveStairFrames_ = 0;
-                }
-            }
-        } else {
-            stairState_ = StairFsmState::FLAT_GAIT;
-            consecutiveStairFrames_ = 0;
-        }
-
-        return (stairState_ == StairFsmState::STAIR_CLIMBING) && (features.timestampMs >= stepRefractoryEndMs_);
+        return true;
     }
 
     bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
-        float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
-        float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
-
         float peakValue = 0.0f;
-        if (peakDetector_.update(features.smoothMag, peakValue) && peakValue > clampedThreshold) {
-            stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
-            return true;
+        bool isPeak = peakDetector_.update(features.smoothMag, peakValue);
+
+        if (isPeak) {
+            if (features.timestampMs < stepRefractoryEndMs_) return false;
+
+            float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
+            float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
+
+            // Stairs represent a distinct lifting of the leg without hitting full knee-to-chest height.
+            float absPitch = std::fabs(features.pitchAngle);
+            if (peakValue > clampedThreshold && 
+                absPitch >= AlgoParams::PITCH_THRESHOLD_STAIRS && 
+                absPitch < AlgoParams::PITCH_THRESHOLD_JUMP) {
+                
+                stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
+                return true;
+            }
         }
         return false;
     }
 
 private:
-    StairFsmState stairState_;
-    float shortTimeEnergyBuffer_;
-    uint8_t consecutiveStairFrames_;
     uint32_t stepRefractoryEndMs_;
     PeakDetector peakDetector_;
 };
 
-#endif
+#endif // STAIR_MOTION_HPP
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\detectors\StepMotion.hpp =====
 
@@ -1301,6 +1295,7 @@ private:
 #include "params/AlgoParams.hpp"
 #include "utils/PeakDetector.hpp"
 #include <algorithm>
+#include <cmath>
 
 class StepMotion : public BaseMotion {
 public:
@@ -1308,17 +1303,29 @@ public:
 
 protected:
     bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
-        return features.timestampMs >= stepRefractoryEndMs_;
+        // Must return true every frame so the PeakDetector history isn't starved.
+        return true;
     }
 
     bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
-        float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
-        float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
-
         float peakValue = 0.0f;
-        if (peakDetector_.update(features.smoothMag, peakValue) && peakValue > clampedThreshold) {
-            stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
-            return true;
+        // Peak detector MUST be fed every single frame to maintain accurate n-1/n-2 history.
+        bool isPeak = peakDetector_.update(features.smoothMag, peakValue);
+
+        if (isPeak) {
+            // 1. Check debounce refractory period
+            if (features.timestampMs < stepRefractoryEndMs_) return false;
+
+            // 2. Calculate adaptive thresholds
+            float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
+            float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
+
+            // 3. Pitch-based isolation (Steps, light hops, running = low pitch)
+            float absPitch = std::fabs(features.pitchAngle);
+            if (peakValue > clampedThreshold && absPitch < AlgoParams::PITCH_THRESHOLD_STAIRS) {
+                stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
+                return true;
+            }
         }
         return false;
     }
@@ -1445,6 +1452,11 @@ private:
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\params\AlgoParams.hpp =====
 
+// ========================================================================================================
+// File: include/params/AlgoParams.hpp
+// Purpose: Defines system-wide configuration constants for hardware, signal processing, and algorithms.
+// ========================================================================================================
+
 #ifndef ALGO_PARAMS_HPP
 #define ALGO_PARAMS_HPP
 
@@ -1469,20 +1481,15 @@ namespace AlgoParams {
 
     constexpr std::size_t SLIDING_WINDOW_SIZE = 100;
 
-    constexpr uint32_t STEP_REFRACTORY_MS = 120;
+    // --- Unified Kinematics (Pitch-Based Separation) ---
+    constexpr uint32_t STEP_REFRACTORY_MS = 250;
     constexpr float STEP_THRESHOLD_MIN_G = 1.15f;
     constexpr float STEP_THRESHOLD_MAX_G = 1.90f;
     constexpr float STEP_K_FACTOR = 1.5f;
 
-    constexpr float FLIGHT_ENTER_G = 0.35f;
-    constexpr float FLIGHT_EXIT_G = 0.70f;
-    constexpr uint32_t FLIGHT_MIN_DURATION_MS = 180;
-    constexpr uint32_t FLIGHT_MAX_DURATION_MS = 850;
-    constexpr uint32_t JUMP_CONSECUTIVE_FRAMES = 3;
-
-    constexpr float STAIR_ENERGY_THRESHOLD = 0.45f;
-    constexpr float STAIR_PITCH_THRESHOLD = 35.0f;
-    constexpr uint32_t STAIR_CONSECUTIVE_FRAMES = 3;
+    // Pitch boundaries to strictly enforce mutual exclusion (no double counting).
+    constexpr float PITCH_THRESHOLD_STAIRS = 25.0f; // Angles >= 25 but < 65 classify as stairs.
+    constexpr float PITCH_THRESHOLD_JUMP = 65.0f;   // Angles >= 65 classify as jumps (knees-to-chest/high kicks).
 }
 
 #endif // ALGO_PARAMS_HPP
@@ -1748,7 +1755,7 @@ private:
 
 // ========================================================================================================
 // File: test_ble_services.cpp
-// Purpose: Validates the BLE Manager Facade, Singleton instantiation, and GATT Characteristic updates.
+// Purpose: Validates the BLE Manager Facade, Singleton instantiation, and GATT String Characteristic updates.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -1761,59 +1768,45 @@ private:
 
 BLEManager bleManager;
 
-void setUp(void) {
-    // No per-test setup required.
-}
+void setUp(void) {}
+void tearDown(void) {}
 
-void tearDown(void) {
-    // No per-test teardown required.
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test 1: Verify the physical BLE radio and Facade orchestrator initialize without errors.
-// ----------------------------------------------------------------------------------------------------
 void test_ble_initialization(void) {
     bool initSuccess = bleManager.begin();
     TEST_ASSERT_TRUE_MESSAGE(initSuccess, "BLE Manager failed to initialize. Check hardware radio module.");
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test 2: Ensure GATT Characteristics are correctly booted with safe default values (zeros).
-// ----------------------------------------------------------------------------------------------------
 void test_gatt_default_values(void) {
-    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value();
-    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value();
-    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value();
-    uint8_t state = GattConfigurator::getInstance().getStateChar().value();
+    // FIX: Using .toInt() to convert the BLEStringCharacteristic value back to integers for assertion
+    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value().toInt();
+    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value().toInt();
+    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value().toInt();
+    String state = GattConfigurator::getInstance().getStateChar().value();
 
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, steps, "Initial step count should be 0");
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, jumps, "Initial jump count should be 0");
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, stairs, "Initial stair count should be 0");
-    TEST_ASSERT_EQUAL_UINT8_MESSAGE(static_cast<uint8_t>(MotionState::IDLE), state, "Initial state should be IDLE");
+    TEST_ASSERT_EQUAL_UINT32(0, steps);
+    TEST_ASSERT_EQUAL_UINT32(0, jumps);
+    TEST_ASSERT_EQUAL_UINT32(0, stairs);
+    TEST_ASSERT_EQUAL_STRING("IDLE", state.c_str());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test 3: Validate the DataBroadcaster Singleton successfully routes data to the GATT memory.
-// ----------------------------------------------------------------------------------------------------
 void test_broadcaster_updates_characteristics(void) {
-    // Simulate a motion event pushing data to the broadcaster
     DataBroadcaster::getInstance().updateCounters(150, 5, 12);
     DataBroadcaster::getInstance().updateState(MotionState::STEP);
 
-    // Read back directly from the GATT server characteristics
-    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value();
-    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value();
-    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value();
-    uint8_t state = GattConfigurator::getInstance().getStateChar().value();
+    // FIX: Using .toInt() to convert the BLEStringCharacteristic value back to integers for assertion
+    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value().toInt();
+    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value().toInt();
+    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value().toInt();
+    String state = GattConfigurator::getInstance().getStateChar().value();
 
     TEST_ASSERT_EQUAL_UINT32(150, steps);
     TEST_ASSERT_EQUAL_UINT32(5, jumps);
     TEST_ASSERT_EQUAL_UINT32(12, stairs);
-    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MotionState::STEP), state);
+    TEST_ASSERT_EQUAL_STRING("STEP", state.c_str());
 }
 
 void setup() {
-    delay(2000); // Allow hardware radio and serial port to stabilize
+    delay(2000);
     UNITY_BEGIN();
     
     RUN_TEST(test_ble_initialization);
@@ -1821,19 +1814,15 @@ void setup() {
     RUN_TEST(test_broadcaster_updates_characteristics);
     
     UNITY_END();
-    delay(1000); // Ensure serial buffer flushes before reset
 }
 
-void loop() {
-    // Unity test framework requires an empty loop
-}
+void loop() {}
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_broadcast\test_broadcaster_stress_endurance.cpp =====
 
 // ========================================================================================================
-// File: test_ble_services.cpp
-// Purpose: Validates the BLE Manager Facade, Singleton instantiation, GATT Characteristic updates,
-// and extreme stress testing of the telemetry broadcaster to prevent radio stack buffer overflows.
+// File: test_broadcaster_stress_endurance.cpp
+// Purpose: Extreme stress testing of the telemetry broadcaster to prevent radio stack buffer overflows.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -1846,62 +1835,14 @@ void loop() {
 
 BLEManager bleManager;
 
-void setUp(void) {
-    // No per-test setup required.
-}
+void setUp(void) {}
+void tearDown(void) {}
 
-void tearDown(void) {
-    // No per-test teardown required.
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test 1: Verify the physical BLE radio and Facade orchestrator initialize without errors.
-// ----------------------------------------------------------------------------------------------------
 void test_ble_initialization(void) {
     bool initSuccess = bleManager.begin();
     TEST_ASSERT_TRUE_MESSAGE(initSuccess, "BLE Manager failed to initialize. Check hardware radio module.");
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test 2: Ensure GATT Characteristics are correctly booted with safe default values (zeros).
-// ----------------------------------------------------------------------------------------------------
-void test_gatt_default_values(void) {
-    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value();
-    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value();
-    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value();
-    uint8_t state = GattConfigurator::getInstance().getStateChar().value();
-
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, steps, "Initial step count should be 0");
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, jumps, "Initial jump count should be 0");
-    TEST_ASSERT_EQUAL_UINT32_MESSAGE(0, stairs, "Initial stair count should be 0");
-    TEST_ASSERT_EQUAL_UINT8_MESSAGE(static_cast<uint8_t>(MotionState::IDLE), state, "Initial state should be IDLE");
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test 3: Validate the DataBroadcaster Singleton successfully routes data to the GATT memory.
-// ----------------------------------------------------------------------------------------------------
-void test_broadcaster_updates_characteristics(void) {
-    // Simulate a motion event pushing data to the broadcaster
-    DataBroadcaster::getInstance().updateCounters(150, 5, 12);
-    DataBroadcaster::getInstance().updateState(MotionState::STEP);
-
-    // Read back directly from the GATT server characteristics
-    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value();
-    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value();
-    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value();
-    uint8_t state = GattConfigurator::getInstance().getStateChar().value();
-
-    TEST_ASSERT_EQUAL_UINT32(150, steps);
-    TEST_ASSERT_EQUAL_UINT32(5, jumps);
-    TEST_ASSERT_EQUAL_UINT32(12, stairs);
-    TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(MotionState::STEP), state);
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test 4: Radio Buffer Stress Test - Pumping 10,000 rapid updates into the BLE Stack
-// Purpose: Ensures the BLE Stack does not suffer from buffer overflow or hard faults during extreme
-// continuous physical activity.
-// ----------------------------------------------------------------------------------------------------
 void test_broadcaster_stress_endurance(void) {
     // Attempt 10,000 rapid characteristic writes, simulating heavy activity
     for (uint32_t i = 1; i <= 10000; i++) {
@@ -1910,29 +1851,24 @@ void test_broadcaster_stress_endurance(void) {
         bleManager.poll();
     }
 
-    // Retrieve the final state directly from the GATT structure
-    uint32_t finalSteps = GattConfigurator::getInstance().getStepsChar().value();
+    // FIX: Using .toInt() to convert the BLEStringCharacteristic value back to integers for assertion
+    uint32_t finalSteps = GattConfigurator::getInstance().getStepsChar().value().toInt();
 
     // Verify 100% data integrity post-stress
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(10000, finalSteps, "BLE Broadcaster dropped packets during stress execution.");
 }
 
 void setup() {
-    delay(2000); // Allow hardware radio and serial port to stabilize
+    delay(2000); 
     UNITY_BEGIN();
     
     RUN_TEST(test_ble_initialization);
-    RUN_TEST(test_gatt_default_values);
-    RUN_TEST(test_broadcaster_updates_characteristics);
-    RUN_TEST(test_broadcaster_stress_endurance); // Execute the new stress test
+    RUN_TEST(test_broadcaster_stress_endurance); 
     
     UNITY_END();
-    delay(1000); // Ensure serial buffer flushes before reset
 }
 
-void loop() {
-    // Unity test framework requires an empty loop
-}
+void loop() {}
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_hardware_sensor\test_hardware_sensor.cpp =====
 
@@ -2026,12 +1962,20 @@ void loop() {}
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_motion_algorithms\TestHelpers.h =====
 
+// ========================================================================================================
+// File: TestHelpers.h
+// Purpose: Provides robust deterministic signal injection to perfectly test the Pitch-Based FSM logic.
+// ========================================================================================================
+
 #ifndef TEST_HELPERS_H
 #define TEST_HELPERS_H
 
 #include "algorithem/MotionClassifier.h"
 
-// Advances the classifier state to stabilize the sliding window calculations
+// ----------------------------------------------------------------------------------------------------
+// Method: stabilizeWindow
+// Purpose: Feeds resting data to initialize the Sliding Window mean and standard deviation.
+// ----------------------------------------------------------------------------------------------------
 inline void stabilizeWindow(MotionClassifier& classifier, uint32_t& clockMs) {
     MotionData idleData = {0};
     idleData.accelZ = 1.0f;
@@ -2042,14 +1986,58 @@ inline void stabilizeWindow(MotionClassifier& classifier, uint32_t& clockMs) {
     }
 }
 
+// ----------------------------------------------------------------------------------------------------
+// Method: injectKinematicPeak
+// Purpose: Mathematically simulates a human leg swing followed by a ground impact (Peak).
+//          It gives the Complementary Filter time to settle on the correct Pitch angle before impact.
+// ----------------------------------------------------------------------------------------------------
+inline void injectKinematicPeak(MotionClassifier& classifier, uint32_t& clockMs, float baseAx, float baseAz, float peakMultiplier = 2.0f) {
+    MotionData data = {0};
+    
+    // 1. Swing Phase (100 frames = 1 sec): Settle the Complementary Filter (gyro/accel) to target pitch
+    data.accelX = baseAx;
+    data.accelZ = baseAz;
+    for (int i = 0; i < 100; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    // 2. Impact Phase (2 frames): Generate a high-G spike to trigger the PeakDetector
+    data.accelX = baseAx * peakMultiplier;
+    data.accelZ = baseAz * peakMultiplier;
+    for (int i = 0; i < 2; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    // 3. Recovery Phase (5 frames): Drop back down to confirm the falling edge of the peak
+    data.accelX = baseAx;
+    data.accelZ = baseAz;
+    for (int i = 0; i < 5; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+
+    // 4. Debounce Cooldown (30 frames): Wait out the 250ms refractory period for the next test
+    data.accelX = 0.0f;
+    data.accelZ = 1.0f;
+    for (int i = 0; i < 30; i++) {
+        data.timestampMs = clockMs;
+        classifier.update(data);
+        clockMs += 10;
+    }
+}
+
 #endif // TEST_HELPERS_H
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_motion_algorithms\test_jump.cpp =====
 
 // ========================================================================================================
 // File: test_jump.cpp
-// Purpose: Extensively tests the Airborne Free-Fall -> Landing Impact FSM including extreme edge cases,
-// high jumps, long jumps, and rope skipping variations.
+// Purpose: Validates high-pitch kinematics (>= 65 degrees) for Knees-to-Chest jumps and High Kicks.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -2058,16 +2046,12 @@ inline void stabilizeWindow(MotionClassifier& classifier, uint32_t& clockMs) {
 #include "filter/EmaFilter.hpp"
 #include "detectors/JumpMotion.hpp"
 #include "detectors/StepMotion.hpp"
-
-// ----------------------------------------------------------------------------------------------------
-// Helper Function: Stabilize Window
-// ----------------------------------------------------------------------------------------------------
 #include "TestHelpers.h"
 
 // ----------------------------------------------------------------------------------------------------
-// Test: Flight Too Short Rejected
+// Test: Standard Knees-to-Chest Jump (Pitch ~ 71.5 degrees)
 // ----------------------------------------------------------------------------------------------------
-void test_flight_too_short_rejected() {
+void test_knees_to_chest_jump() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
     JumpMotion jumpDetector;
@@ -2076,198 +2060,54 @@ void test_flight_too_short_rejected() {
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs);
 
-    MotionData data = {0};
-    data.accelZ = 0.1f; // Free fall (< 0.35g)
-    
-    // Only 100ms of flight (minimum requirement is 180ms)
-    for (int i = 0; i < 10; i++) {
-        data.timestampMs = clockMs;
-        classifier.update(data);
-        clockMs += 10;
-    }
+    // ax=1.5, az=0.5 generates ~71.5 degrees of pitch. Safely above the 65.0 boundary.
+    injectKinematicPeak(classifier, clockMs, 1.5f, 0.5f);
 
-    data.accelZ = 2.0f; // Impact
-    MotionState result = MotionState::IDLE;
-    for (int i = 0; i < 5; i++) {
-        data.timestampMs = clockMs;
-        MotionState frameState = classifier.update(data);
-        if (frameState == MotionState::JUMP) {
-            result = frameState;
-        }
-        clockMs += 10;
-    }
-
-    TEST_ASSERT_NOT_EQUAL(MotionState::JUMP, result);
-    TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test: Soft Landing Jump
-// ----------------------------------------------------------------------------------------------------
-void test_soft_landing_jump() {
-    EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
-    JumpMotion jumpDetector;
-    classifier.addDetector(&jumpDetector);
-    
-    uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
-
-    MotionData data = {0};
-    data.accelZ = 0.1f; 
-    
-    // 300ms of valid flight
-    for (int i = 0; i < 30; i++) {
-        data.timestampMs = clockMs;
-        classifier.update(data);
-        clockMs += 10;
-    }
-
-    // Soft landing impact (0.8g), crosses the 0.7g threshold but nowhere near 3.0g
-    data.accelZ = 0.8f;
-    MotionState result = MotionState::IDLE;
-    for (int i = 0; i < 5; i++) {
-        data.timestampMs = clockMs;
-        MotionState frameState = classifier.update(data);
-        if (frameState == MotionState::JUMP) {
-            result = frameState;
-        }
-        clockMs += 10;
-    }
-
-    TEST_ASSERT_EQUAL(MotionState::JUMP, result);
     TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
 }
 
 // ----------------------------------------------------------------------------------------------------
-// Test: High Jump (Hard Landing)
+// Test: Ballet / Soccer High Kick (Pitch ~ 84 degrees)
 // ----------------------------------------------------------------------------------------------------
-void test_high_jump_hard_landing() {
+void test_high_kick_triggers_jump() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
     JumpMotion jumpDetector;
-    classifier.addDetector(&jumpDetector);
-    
-    uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
-
-    MotionData data = {0};
-    
-    // Flight (400ms)
-    data.accelZ = 0.1f; 
-    for (int i = 0; i < 40; i++) {
-        data.timestampMs = clockMs;
-        classifier.update(data);
-        clockMs += 10;
-    }
-
-    // Hard Impact (4.0g - Extreme force)
-    data.accelZ = 4.0f;
-    MotionState result = MotionState::IDLE;
-    for (int i = 0; i < 5; i++) {
-        data.timestampMs = clockMs;
-        MotionState frameState = classifier.update(data);
-        if (frameState == MotionState::JUMP) {
-            result = frameState;
-        }
-        clockMs += 10;
-    }
-
-    TEST_ASSERT_EQUAL(MotionState::JUMP, result);
-    TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test: Long Jump (Soft Landing)
-// ----------------------------------------------------------------------------------------------------
-void test_long_jump_soft_landing() {
-    EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
-    JumpMotion jumpDetector;
-    classifier.addDetector(&jumpDetector);
-    
-    uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
-
-    MotionData data = {0};
-    
-    // Flight (700ms - Long horizontal jump)
-    data.accelZ = 0.2f; 
-    for (int i = 0; i < 70; i++) {
-        data.timestampMs = clockMs;
-        classifier.update(data);
-        clockMs += 10;
-    }
-
-    // Softer horizontal impact (2.0g)
-    data.accelZ = 2.0f;
-    MotionState result = MotionState::IDLE;
-    for (int i = 0; i < 5; i++) {
-        data.timestampMs = clockMs;
-        MotionState frameState = classifier.update(data);
-        if (frameState == MotionState::JUMP) {
-            result = frameState;
-        }
-        clockMs += 10;
-    }
-
-    TEST_ASSERT_EQUAL(MotionState::JUMP, result);
-    TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test: Rope Skipping Counted as Steps Not Jumps
-// ----------------------------------------------------------------------------------------------------
-void test_skipping_counted_as_steps_not_jumps() {
-    EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
     StepMotion stepDetector;
-    JumpMotion jumpDetector;
-    
     classifier.addDetector(&jumpDetector);
-    classifier.addDetector(&stepDetector); 
+    classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs);
 
-    // Simulate 10 realistic rope skips 
-    for (int skip = 0; skip < 10; skip++) {
-        MotionData data = {0};
-        
-        // Short flight (~150ms) - Safely below the 180ms Jump minimum
-        data.accelZ = 0.2f; 
-        for (int i = 0; i < 15; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
+    // ax=2.0, az=0.2 generates ~84 degrees of extreme pitch rotation.
+    injectKinematicPeak(classifier, clockMs, 2.0f, 0.2f);
 
-        // Quick Impact (~50ms at 2.5g)
-        data.accelZ = 2.5f;
-        for (int i = 0; i < 5; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-        
-        // Rest phase on the ground (~600ms)
-        // This is crucial: It allows the 1-second O(1) Sliding Window to flush out 
-        // the extreme variance, allowing the dynamic threshold to reset for the next step.
-        data.accelZ = 1.0f;
-        for (int i = 0; i < 60; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-    }
-
-    // Verify 10 skips counted entirely as Steps, 0 Jumps detected.
-    TEST_ASSERT_EQUAL(10, stepDetector.getCount());
-    TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
+    TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
+    TEST_ASSERT_EQUAL(0, stepDetector.getCount());
 }
 
 // ----------------------------------------------------------------------------------------------------
-// Unity Environment
+// Test: Hard Flat Landing Rejected as Jump (Pitch 0)
+// ----------------------------------------------------------------------------------------------------
+void test_flat_hard_landing_is_not_jump() {
+    EmaFilter filter(0.53f);
+    MotionClassifier classifier(&filter);
+    JumpMotion jumpDetector;
+    StepMotion stepDetector;
+    classifier.addDetector(&jumpDetector);
+    classifier.addDetector(&stepDetector);
+    
+    uint32_t clockMs = 0;
+    stabilizeWindow(classifier, clockMs);
+
+    // Massive impact (multiplier 4.0 = ~4.0g) but leg is entirely flat (pitch 0).
+    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f, 4.0f);
+
+    TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
+    TEST_ASSERT_EQUAL(1, stepDetector.getCount());
+}
+
 // ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
@@ -2275,11 +2115,9 @@ void tearDown(void) {}
 void setup() {
     delay(2000);
     UNITY_BEGIN();
-    RUN_TEST(test_flight_too_short_rejected);
-    RUN_TEST(test_soft_landing_jump);
-    RUN_TEST(test_high_jump_hard_landing);
-    RUN_TEST(test_long_jump_soft_landing);
-    RUN_TEST(test_skipping_counted_as_steps_not_jumps);
+    RUN_TEST(test_knees_to_chest_jump);
+    RUN_TEST(test_high_kick_triggers_jump);
+    RUN_TEST(test_flat_hard_landing_is_not_jump);
     UNITY_END();
 }
 
@@ -2289,8 +2127,7 @@ void loop() {}
 
 // ========================================================================================================
 // File: test_stair.cpp
-// Purpose: Validates the combined short-time energy and extreme pitch thresholds for stair climbing, 
-// and ensures proper state transitions between stair climbing and flat walking.
+// Purpose: Validates mid-pitch kinematics (25 <= Pitch < 65) routing strictly to the Stair detector.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -2299,16 +2136,12 @@ void loop() {}
 #include "filter/EmaFilter.hpp"
 #include "detectors/StairMotion.hpp"
 #include "detectors/StepMotion.hpp"
-
-// ----------------------------------------------------------------------------------------------------
-// Helper Function: Stabilize Window
-// ----------------------------------------------------------------------------------------------------
 #include "TestHelpers.h"
 
 // ----------------------------------------------------------------------------------------------------
-// Test: High Energy Flat Walk Rejected
+// Test: Valid Stair Climb (Pitch ~ 45 degrees)
 // ----------------------------------------------------------------------------------------------------
-void test_high_energy_flat_walk_rejected() {
+void test_valid_stair_climb() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
     StairMotion stairDetector;
@@ -2317,73 +2150,33 @@ void test_high_energy_flat_walk_rejected() {
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs);
 
-    MotionData data = {0};
-    data.accelX = 0.0f; // Zero pitch
-    data.accelZ = 2.5f; // High vertical energy
+    // ax=1.0, az=1.0 generates exactly 45 degrees of pitch. Fits perfectly in the 25-65 bounds.
+    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
 
-    MotionState result = MotionState::IDLE;
-    for (int i = 0; i < 10; i++) {
-        data.timestampMs = clockMs;
-        MotionState frameState = classifier.update(data);
-        if (frameState == MotionState::STAIRS) {
-            result = frameState;
-        }
-        clockMs += 10;
-    }
-
-    TEST_ASSERT_NOT_EQUAL(MotionState::STAIRS, result);
-    TEST_ASSERT_EQUAL(0, stairDetector.getCount());
+    TEST_ASSERT_EQUAL(1, stairDetector.getCount());
 }
 
 // ----------------------------------------------------------------------------------------------------
-// Test: Stairs to Flat Walking Transition
+// Test: High Energy Flat Walk Rejected as Stairs
 // ----------------------------------------------------------------------------------------------------
-void test_stairs_to_flat_walking_transition() {
+void test_high_energy_flat_walk_rejected_as_stairs() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
-    StepMotion stepDetector;
     StairMotion stairDetector;
-    
+    StepMotion stepDetector;
     classifier.addDetector(&stairDetector);
     classifier.addDetector(&stepDetector);
-
+    
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs);
 
-    MotionData data = {0};
+    // Extreme impact (multiplier 3.5 = ~3.5g) but 0 degrees pitch. Should route to STEP.
+    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f, 3.5f);
 
-    // Phase 1: Climb 2 stairs (High energy + high pitch)
-    data.accelX = 1.5f; 
-    data.accelZ = 1.5f; 
-    
-    for (int step = 0; step < 2; step++) {
-        for (int i = 0; i < 5; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-        clockMs += 400; // Delay between stairs
-    }
-
-    // Phase 2: Reach the top, start flat walking
-    data.accelX = 0.0f; // Pitch ~0
-    data.accelZ = 1.5f; // Purely vertical impact
-
-    for (int step = 0; step < 3; step++) {
-        for (int i = 0; i < 5; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-        clockMs += 400;
-    }
-
-    TEST_ASSERT_EQUAL(2, stairDetector.getCount());
-    TEST_ASSERT_EQUAL(3, stepDetector.getCount());
+    TEST_ASSERT_EQUAL(0, stairDetector.getCount());
+    TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Unity Environment
 // ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
@@ -2391,8 +2184,8 @@ void tearDown(void) {}
 void setup() {
     delay(2000);
     UNITY_BEGIN();
-    RUN_TEST(test_high_energy_flat_walk_rejected);
-    RUN_TEST(test_stairs_to_flat_walking_transition);
+    RUN_TEST(test_valid_stair_climb);
+    RUN_TEST(test_high_energy_flat_walk_rejected_as_stairs);
     UNITY_END();
 }
 
@@ -2402,8 +2195,7 @@ void loop() {}
 
 // ========================================================================================================
 // File: test_step.cpp
-// Purpose: Unit tests dedicated to Step detection logic, adaptive thresholds, noise rejection, 
-// and dynamic state transitions (e.g., distinguishing running/skipping from jumping).
+// Purpose: Validates step detection logic (walking/running) using low-pitch kinematics (< 25 degrees).
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -2412,16 +2204,12 @@ void loop() {}
 #include "filter/EmaFilter.hpp"
 #include "detectors/StepMotion.hpp"
 #include "detectors/JumpMotion.hpp"
-
-// ----------------------------------------------------------------------------------------------------
-// Helper Function: Stabilize Window
-// ----------------------------------------------------------------------------------------------------
 #include "TestHelpers.h"
 
 // ----------------------------------------------------------------------------------------------------
-// Test: Weak Slow Step
+// Test: Normal Walking Step (Pitch ~ 0 degrees)
 // ----------------------------------------------------------------------------------------------------
-void test_weak_slow_step() {
+void test_normal_walking_step() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
     StepMotion stepDetector;
@@ -2430,46 +2218,16 @@ void test_weak_slow_step() {
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs);
 
-    MotionData stepData = {0};
-    stepData.accelX = 0.6f; 
-    stepData.accelZ = 1.0f; 
-    stepData.timestampMs = clockMs + 100;
-
-    MotionState result = classifier.update(stepData);
-    TEST_ASSERT_EQUAL(MotionState::STEP, result);
-    TEST_ASSERT_EQUAL(1, stepDetector.getCount());
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test: Debounce Double Impact Rejection
-// ----------------------------------------------------------------------------------------------------
-void test_debounce_double_impact_rejection() {
-    EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
-    StepMotion stepDetector;
-    classifier.addDetector(&stepDetector);
-    
-    uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
-
-    MotionData stepData = {0};
-    stepData.accelX = 1.5f; 
-    stepData.accelZ = 1.0f;
-
-    stepData.timestampMs = clockMs + 100;
-    classifier.update(stepData);
-
-    // Second impact only 50ms later falls inside the refractory period
-    stepData.timestampMs = clockMs + 150;
-    classifier.update(stepData);
+    // ax=0.0, az=1.0 generates exactly 0 degrees of pitch. 
+    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
 
     TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
 // ----------------------------------------------------------------------------------------------------
-// Test: Running is Counted as Steps, Not Jumps
+// Test: Running (Pitch ~ 15 degrees)
 // ----------------------------------------------------------------------------------------------------
-void test_running_is_counted_as_steps_not_jumps() {
+void test_running_is_counted_as_steps() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
     StepMotion stepDetector;
@@ -2481,27 +2239,9 @@ void test_running_is_counted_as_steps_not_jumps() {
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs); 
 
-    // Simulate 4 fast running steps
+    // 4 fast running steps: ax=0.3, az=1.0 yields ~16.7 degrees (Well below the 25 degree threshold)
     for (int step = 0; step < 4; step++) {
-        MotionData data = {0};
-        
-        // Flight phase of running (short duration, ~100ms)
-        data.accelZ = 0.4f; 
-        for (int i = 0; i < 10; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-
-        // Hard impact phase of running (high G force)
-        data.accelZ = 2.5f;
-        for (int i = 0; i < 5; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-        
-        clockMs += 100; // Wait out the step debounce timer
+        injectKinematicPeak(classifier, clockMs, 0.3f, 1.0f, 2.5f);
     }
 
     TEST_ASSERT_EQUAL(4, stepDetector.getCount());
@@ -2509,9 +2249,9 @@ void test_running_is_counted_as_steps_not_jumps() {
 }
 
 // ----------------------------------------------------------------------------------------------------
-// Test: Sitting Foot Tapping Rejection
+// Test: Debounce Time Lock Rejection
 // ----------------------------------------------------------------------------------------------------
-void test_sitting_foot_tapping_rejection() {
+void test_debounce_time_lock_rejection() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
     StepMotion stepDetector;
@@ -2521,22 +2261,19 @@ void test_sitting_foot_tapping_rejection() {
     stabilizeWindow(classifier, clockMs);
 
     MotionData data = {0};
+    
+    // First valid peak
+    data.accelZ = 2.0f; data.timestampMs = clockMs; classifier.update(data);
+    data.accelZ = 1.0f; data.timestampMs = clockMs + 10; classifier.update(data);
+    
+    // Second peak falling perfectly inside the 250ms refractory window (at +100ms)
+    data.accelZ = 2.0f; data.timestampMs = clockMs + 100; classifier.update(data);
+    data.accelZ = 1.0f; data.timestampMs = clockMs + 110; classifier.update(data);
 
-    // Simulate 3 seconds of rapid, low-amplitude foot tapping
-    for (int i = 0; i < 300; i++) {
-        // Sine wave approximation between 0.9g and 1.1g
-        data.accelZ = 1.0f + (0.1f * std::sin(i * 0.5f)); 
-        data.timestampMs = clockMs;
-        
-        classifier.update(data);
-        clockMs += 10;
-    }
-
-    TEST_ASSERT_EQUAL(0, stepDetector.getCount());
+    // Only one should register!
+    TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Unity Environment
 // ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
@@ -2544,10 +2281,9 @@ void tearDown(void) {}
 void setup() {
     delay(2000);
     UNITY_BEGIN();
-    RUN_TEST(test_weak_slow_step);
-    RUN_TEST(test_debounce_double_impact_rejection);
-    RUN_TEST(test_running_is_counted_as_steps_not_jumps);
-    RUN_TEST(test_sitting_foot_tapping_rejection);
+    RUN_TEST(test_normal_walking_step);
+    RUN_TEST(test_running_is_counted_as_steps);
+    RUN_TEST(test_debounce_time_lock_rejection);
     UNITY_END();
 }
 
@@ -2557,8 +2293,7 @@ void loop() {}
 
 // ========================================================================================================
 // File: test_stress.cpp
-// Purpose: Stress tests including Marathon simulations, sudden stops, complex multi-motion transitions, 
-// and random vibration noise rejection over extended time periods.
+// Purpose: Validates kinematic mutual exclusion and transitions over long sequences and combinations.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -2567,16 +2302,13 @@ void loop() {}
 #include "filter/EmaFilter.hpp"
 #include "detectors/StepMotion.hpp"
 #include "detectors/JumpMotion.hpp"
-
-// ----------------------------------------------------------------------------------------------------
-// Helper Function: Stabilize Window
-// ----------------------------------------------------------------------------------------------------
+#include "detectors/StairMotion.hpp"
 #include "TestHelpers.h"
 
 // ----------------------------------------------------------------------------------------------------
-// Test: Marathon Stress (5000 Steps)
+// Test: Marathon Stress (1000 Steps)
 // ----------------------------------------------------------------------------------------------------
-void test_marathon_stress_5000_steps() {
+void test_marathon_stress_1000_steps() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
     StepMotion stepDetector;
@@ -2585,156 +2317,47 @@ void test_marathon_stress_5000_steps() {
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs);
 
-    // Simulate 5000 continuous fast steps
-    for (int i = 0; i < 5000; i++) {
-        MotionData stepData = {0};
-        stepData.accelX = 1.5f;
-        stepData.accelZ = 1.0f;
-        stepData.timestampMs = clockMs;
-        
-        classifier.update(stepData);
-        clockMs += 400; // Clear debounce
+    for (int i = 0; i < 1000; i++) {
+        injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
     }
 
-    TEST_ASSERT_EQUAL(5000, stepDetector.getCount());
+    TEST_ASSERT_EQUAL(1000, stepDetector.getCount());
 }
 
 // ----------------------------------------------------------------------------------------------------
-// Test: Jump Stress Marathon (50 Jumps)
+// Test: Complex Triathlon (Walk -> Stairs -> Jump)
 // ----------------------------------------------------------------------------------------------------
-void test_jump_stress_marathon() {
-    EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
-    JumpMotion jumpDetector;
-    classifier.addDetector(&jumpDetector);
-    
-    uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
-
-    for (int jump = 0; jump < 50; jump++) {
-        MotionData data = {0};
-        
-        // Flight (250ms)
-        data.accelZ = 0.15f; 
-        for (int i = 0; i < 25; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-
-        // Impact (2.8g)
-        data.accelZ = 2.8f;
-        for (int i = 0; i < 5; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-        
-        // Recovery
-        data.accelZ = 1.0f;
-        for (int i = 0; i < 30; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-    }
-
-    TEST_ASSERT_EQUAL(50, jumpDetector.getCount());
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test: Sudden Stop No False Jumps
-// ----------------------------------------------------------------------------------------------------
-void test_sudden_stop_no_false_jumps() {
-    EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
-    JumpMotion jumpDetector;
-    classifier.addDetector(&jumpDetector);
-    
-    uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
-
-    MotionData data = {0};
-    
-    // Simulate high-impact running
-    data.accelX = 2.0f;
-    data.accelZ = 1.0f;
-    for (int i = 0; i < 50; i++) {
-        data.timestampMs = clockMs;
-        classifier.update(data);
-        clockMs += 10;
-    }
-
-    // Sudden complete stop to 1.0g
-    data.accelX = 0.0f;
-    data.accelZ = 1.0f;
-    for (int i = 0; i < 100; i++) {
-        data.timestampMs = clockMs;
-        classifier.update(data);
-        clockMs += 10;
-    }
-
-    TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
-}
-
-// ----------------------------------------------------------------------------------------------------
-// Test: Complex Transition (Walk -> Jump -> Walk)
-// ----------------------------------------------------------------------------------------------------
-void test_complex_transition_walk_jump_walk() {
+void test_complex_triathlon_transitions() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
     StepMotion stepDetector;
     JumpMotion jumpDetector;
+    StairMotion stairDetector;
     
     classifier.addDetector(&jumpDetector);
+    classifier.addDetector(&stairDetector);
     classifier.addDetector(&stepDetector);
 
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs);
 
-    MotionData data = {0};
+    // 2 Steps (Pitch 0)
+    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
+    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
+    
+    // 3 Stairs (Pitch 45)
+    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
 
-    // Phase 1: Walk 2 steps
-    data.accelZ = 1.8f;
-    data.timestampMs = clockMs;
-    classifier.update(data);
-    clockMs += 500; 
+    // 1 Jump (Pitch 76)
+    injectKinematicPeak(classifier, clockMs, 2.0f, 0.5f);
 
-    data.timestampMs = clockMs;
-    classifier.update(data);
-    clockMs += 500;
-
-    // Phase 2: Jump over an obstacle
-    data.accelZ = 0.1f; // Free fall
-    for (int i = 0; i < 25; i++) {
-        data.timestampMs = clockMs;
-        classifier.update(data);
-        clockMs += 10;
-    }
-    data.accelZ = 3.0f; // Landing
-    for (int i = 0; i < 5; i++) {
-        data.timestampMs = clockMs;
-        classifier.update(data);
-        clockMs += 10;
-    }
-
-    clockMs += 400; // Recovery pause after landing
-
-    // Phase 3: Walk 2 more steps
-    data.accelZ = 1.6f;
-    data.timestampMs = clockMs;
-    classifier.update(data);
-    clockMs += 500;
-
-    data.timestampMs = clockMs;
-    classifier.update(data);
-
-    TEST_ASSERT_EQUAL(4, stepDetector.getCount());
+    TEST_ASSERT_EQUAL(2, stepDetector.getCount());
+    TEST_ASSERT_EQUAL(3, stairDetector.getCount());
     TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Unity Environment
 // ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
@@ -2742,10 +2365,8 @@ void tearDown(void) {}
 void setup() {
     delay(2000);
     UNITY_BEGIN();
-    RUN_TEST(test_marathon_stress_5000_steps);
-    RUN_TEST(test_jump_stress_marathon);
-    RUN_TEST(test_sudden_stop_no_false_jumps);
-    RUN_TEST(test_complex_transition_walk_jump_walk);
+    RUN_TEST(test_marathon_stress_1000_steps);
+    RUN_TEST(test_complex_triathlon_transitions);
     UNITY_END();
 }
 

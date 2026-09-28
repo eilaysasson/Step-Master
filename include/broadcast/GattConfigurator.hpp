@@ -1,8 +1,3 @@
-// ========================================================================================================
-// File: GattConfigurator.hpp
-// Purpose: Singleton class responsible for defining and registering the BLE GATT services and characteristics.
-// ========================================================================================================
-
 #ifndef GATT_CONFIGURATOR_HPP
 #define GATT_CONFIGURATOR_HPP
 
@@ -38,19 +33,22 @@ public:
         batteryService_.addCharacteristic(batteryLevelChar_);
         BLE.addService(batteryService_);
 
-        stepsChar_.writeValue(0);
-        jumpsChar_.writeValue(0);
-        stairsChar_.writeValue(0);
-        stateChar_.writeValue(static_cast<uint8_t>(MotionState::IDLE));
+        // Initialize with default readable text values
+        stepsChar_.writeValue("0");
+        jumpsChar_.writeValue("0");
+        stairsChar_.writeValue("0");
+        stateChar_.writeValue("IDLE");
         batteryLevelChar_.writeValue(100);
+        
+        BLE.advertise();
     }
 
-    BLEUnsignedIntCharacteristic& getStepsChar() { return stepsChar_; }
-    BLEUnsignedIntCharacteristic& getJumpsChar() { return jumpsChar_; }
-    BLEUnsignedIntCharacteristic& getStairsChar() { return stairsChar_; }
-    BLEByteCharacteristic& getStateChar() { return stateChar_; }
+    // Accessors modified to return BLEStringCharacteristic
+    BLEStringCharacteristic& getStepsChar() { return stepsChar_; }
+    BLEStringCharacteristic& getJumpsChar() { return jumpsChar_; }
+    BLEStringCharacteristic& getStairsChar() { return stairsChar_; }
+    BLEStringCharacteristic& getStateChar() { return stateChar_; }
 
-    // Check if the central device is actually subscribed to notifications
     bool isStepsSubscribed() { return stepsChar_.subscribed(); }
     bool isJumpsSubscribed() { return jumpsChar_.subscribed(); }
     bool isStairsSubscribed() { return stairsChar_.subscribed(); }
@@ -59,10 +57,11 @@ public:
 private:
     GattConfigurator() : 
         stepMasterService_(BLEConfig::SERVICE_UUID),
-        stepsChar_(BLEConfig::CHAR_STEPS_UUID, BLERead | BLENotify),
-        jumpsChar_(BLEConfig::CHAR_JUMPS_UUID, BLERead | BLENotify),
-        stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify),
-        stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify),
+        // Max 15 bytes string length - highly optimized
+        stepsChar_(BLEConfig::CHAR_STEPS_UUID, BLERead | BLENotify, 15),
+        jumpsChar_(BLEConfig::CHAR_JUMPS_UUID, BLERead | BLENotify, 15),
+        stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify, 15),
+        stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify, 15),
         batteryService_(BLEConfig::BATTERY_SERVICE_UUID),
         batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify),
         stepsNameDescriptor_("2901", "Step Count"),
@@ -71,18 +70,18 @@ private:
         stateNameDescriptor_("2901", "Motion State") {}
 
     BLEService stepMasterService_;
-    BLEUnsignedIntCharacteristic stepsChar_;
-    BLEUnsignedIntCharacteristic jumpsChar_;
-    BLEUnsignedIntCharacteristic stairsChar_;
-    BLEByteCharacteristic stateChar_;
-
+    BLEStringCharacteristic stepsChar_;
+    BLEStringCharacteristic jumpsChar_;
+    BLEStringCharacteristic stairsChar_;
+    BLEStringCharacteristic stateChar_;
+    
+    BLEService batteryService_;
+    BLEUnsignedCharCharacteristic batteryLevelChar_;
+    
     BLEDescriptor stepsNameDescriptor_;
     BLEDescriptor jumpsNameDescriptor_;
     BLEDescriptor stairsNameDescriptor_;
     BLEDescriptor stateNameDescriptor_;
-    
-    BLEService batteryService_;
-    BLEUnsignedCharCharacteristic batteryLevelChar_;
 };
 
 #endif // GATT_CONFIGURATOR_HPP

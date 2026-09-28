@@ -1,7 +1,6 @@
 // ========================================================================================================
 // File: test_stair.cpp
-// Purpose: Validates the combined short-time energy and extreme pitch thresholds for stair climbing, 
-// and ensures proper state transitions between stair climbing and flat walking.
+// Purpose: Validates mid-pitch kinematics (25 <= Pitch < 65) routing strictly to the Stair detector.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -10,16 +9,12 @@
 #include "filter/EmaFilter.hpp"
 #include "detectors/StairMotion.hpp"
 #include "detectors/StepMotion.hpp"
-
-// ----------------------------------------------------------------------------------------------------
-// Helper Function: Stabilize Window
-// ----------------------------------------------------------------------------------------------------
 #include "TestHelpers.h"
 
 // ----------------------------------------------------------------------------------------------------
-// Test: High Energy Flat Walk Rejected
+// Test: Valid Stair Climb (Pitch ~ 45 degrees)
 // ----------------------------------------------------------------------------------------------------
-void test_high_energy_flat_walk_rejected() {
+void test_valid_stair_climb() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
     StairMotion stairDetector;
@@ -28,73 +23,33 @@ void test_high_energy_flat_walk_rejected() {
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs);
 
-    MotionData data = {0};
-    data.accelX = 0.0f; // Zero pitch
-    data.accelZ = 2.5f; // High vertical energy
+    // ax=1.0, az=1.0 generates exactly 45 degrees of pitch. Fits perfectly in the 25-65 bounds.
+    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
 
-    MotionState result = MotionState::IDLE;
-    for (int i = 0; i < 10; i++) {
-        data.timestampMs = clockMs;
-        MotionState frameState = classifier.update(data);
-        if (frameState == MotionState::STAIRS) {
-            result = frameState;
-        }
-        clockMs += 10;
-    }
-
-    TEST_ASSERT_NOT_EQUAL(MotionState::STAIRS, result);
-    TEST_ASSERT_EQUAL(0, stairDetector.getCount());
+    TEST_ASSERT_EQUAL(1, stairDetector.getCount());
 }
 
 // ----------------------------------------------------------------------------------------------------
-// Test: Stairs to Flat Walking Transition
+// Test: High Energy Flat Walk Rejected as Stairs
 // ----------------------------------------------------------------------------------------------------
-void test_stairs_to_flat_walking_transition() {
+void test_high_energy_flat_walk_rejected_as_stairs() {
     EmaFilter filter(0.53f);
     MotionClassifier classifier(&filter);
-    StepMotion stepDetector;
     StairMotion stairDetector;
-    
+    StepMotion stepDetector;
     classifier.addDetector(&stairDetector);
     classifier.addDetector(&stepDetector);
-
+    
     uint32_t clockMs = 0;
     stabilizeWindow(classifier, clockMs);
 
-    MotionData data = {0};
+    // Extreme impact (multiplier 3.5 = ~3.5g) but 0 degrees pitch. Should route to STEP.
+    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f, 3.5f);
 
-    // Phase 1: Climb 2 stairs (High energy + high pitch)
-    data.accelX = 1.5f; 
-    data.accelZ = 1.5f; 
-    
-    for (int step = 0; step < 2; step++) {
-        for (int i = 0; i < 5; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-        clockMs += 400; // Delay between stairs
-    }
-
-    // Phase 2: Reach the top, start flat walking
-    data.accelX = 0.0f; // Pitch ~0
-    data.accelZ = 1.5f; // Purely vertical impact
-
-    for (int step = 0; step < 3; step++) {
-        for (int i = 0; i < 5; i++) {
-            data.timestampMs = clockMs;
-            classifier.update(data);
-            clockMs += 10;
-        }
-        clockMs += 400;
-    }
-
-    TEST_ASSERT_EQUAL(2, stairDetector.getCount());
-    TEST_ASSERT_EQUAL(3, stepDetector.getCount());
+    TEST_ASSERT_EQUAL(0, stairDetector.getCount());
+    TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Unity Environment
 // ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
@@ -102,8 +57,8 @@ void tearDown(void) {}
 void setup() {
     delay(2000);
     UNITY_BEGIN();
-    RUN_TEST(test_high_energy_flat_walk_rejected);
-    RUN_TEST(test_stairs_to_flat_walking_transition);
+    RUN_TEST(test_valid_stair_climb);
+    RUN_TEST(test_high_energy_flat_walk_rejected_as_stairs);
     UNITY_END();
 }
 

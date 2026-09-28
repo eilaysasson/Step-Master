@@ -1,12 +1,8 @@
-// ========================================================================================================
-// File: DataBroadcaster.hpp
-// Purpose: Singleton class handling the transmission of telemetry data over the configured BLE characteristics.
-// ========================================================================================================
-
 #ifndef DATA_BROADCASTER_HPP
 #define DATA_BROADCASTER_HPP
 
 #include <cstdint>
+#include <Arduino.h>
 #include "GattConfigurator.hpp"
 #include "BleConnection.hpp"
 #include "params/MotionState.h"
@@ -22,22 +18,21 @@ public:
     DataBroadcaster& operator=(const DataBroadcaster&) = delete;
 
     void updateCounters(uint32_t steps, uint32_t jumps, uint32_t stairs) {
-        // Dedup: Only write and poll the BLE stack if the specific counter has actually changed.
-        // ArduinoBLE handles the decision of whether to send a notification under the hood.
+        // String conversion happens ONLY when a counter actually changes, ensuring top performance.
         if (steps != lastSteps_) {
-            GattConfigurator::getInstance().getStepsChar().writeValue(steps);
+            GattConfigurator::getInstance().getStepsChar().writeValue(String(steps));
             lastSteps_ = steps;
             BleConnection::getInstance().poll();
         }
         
         if (jumps != lastJumps_) {
-            GattConfigurator::getInstance().getJumpsChar().writeValue(jumps);
+            GattConfigurator::getInstance().getJumpsChar().writeValue(String(jumps));
             lastJumps_ = jumps;
             BleConnection::getInstance().poll();
         }
         
         if (stairs != lastStairs_) {
-            GattConfigurator::getInstance().getStairsChar().writeValue(stairs);
+            GattConfigurator::getInstance().getStairsChar().writeValue(String(stairs));
             lastStairs_ = stairs;
             BleConnection::getInstance().poll();
         }
@@ -45,7 +40,13 @@ public:
 
     void updateState(MotionState state) {
         if (state != lastState_) {
-            GattConfigurator::getInstance().getStateChar().writeValue(static_cast<uint8_t>(state));
+            String stateStr = "IDLE";
+            if (state == MotionState::STEP) stateStr = "STEP";
+            else if (state == MotionState::JUMP) stateStr = "JUMP";
+            else if (state == MotionState::STAIRS) stateStr = "STAIRS";
+            else if (state == MotionState::NOISE) stateStr = "NOISE";
+
+            GattConfigurator::getInstance().getStateChar().writeValue(stateStr);
             lastState_ = state;
             BleConnection::getInstance().poll();
         }
