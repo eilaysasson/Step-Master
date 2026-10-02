@@ -1,4 +1,4 @@
-#include "hal/SampleTimer.h"
+#include "utils/SampleTimer.h"
 #include <Arduino.h>
 #include <NRF52_MBED_TimerInterrupt.h>
 

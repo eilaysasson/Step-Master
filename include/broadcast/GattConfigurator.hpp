@@ -1,3 +1,8 @@
+// ========================================================================================================
+// File: GattConfigurator.hpp
+// Purpose: Configures BLE services and characteristics.
+// ========================================================================================================
+
 #ifndef GATT_CONFIGURATOR_HPP
 #define GATT_CONFIGURATOR_HPP
 
@@ -7,13 +12,18 @@
 
 class GattConfigurator {
 public:
-    static GattConfigurator& getInstance() {
-        static GattConfigurator instance;
-        return instance;
-    }
-
-    GattConfigurator(const GattConfigurator&) = delete;
-    GattConfigurator& operator=(const GattConfigurator&) = delete;
+    GattConfigurator() : 
+        stepMasterService_(BLEConfig::SERVICE_UUID),
+        stepsChar_(BLEConfig::CHAR_STEPS_UUID, BLERead | BLENotify, 15),
+        jumpsChar_(BLEConfig::CHAR_JUMPS_UUID, BLERead | BLENotify, 15),
+        stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify, 15),
+        stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify, 15),
+        batteryService_(BLEConfig::BATTERY_SERVICE_UUID),
+        batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify),
+        stepsNameDescriptor_("2901", "Step Count"),
+        jumpsNameDescriptor_("2901", "Jump Count"),
+        stairsNameDescriptor_("2901", "Stair Count"),
+        stateNameDescriptor_("2901", "Motion State") {}
 
     void setupServices() {
         BLE.setAdvertisedService(stepMasterService_);
@@ -33,17 +43,13 @@ public:
         batteryService_.addCharacteristic(batteryLevelChar_);
         BLE.addService(batteryService_);
 
-        // Initialize with default readable text values
         stepsChar_.writeValue("0");
         jumpsChar_.writeValue("0");
         stairsChar_.writeValue("0");
         stateChar_.writeValue("IDLE");
-        batteryLevelChar_.writeValue(100);
-        
-        BLE.advertise();
+        batteryLevelChar_.writeValue(batteryLevelChar_.value());
     }
 
-    // Accessors modified to return BLEStringCharacteristic
     BLEStringCharacteristic& getStepsChar() { return stepsChar_; }
     BLEStringCharacteristic& getJumpsChar() { return jumpsChar_; }
     BLEStringCharacteristic& getStairsChar() { return stairsChar_; }
@@ -55,20 +61,6 @@ public:
     bool isStateSubscribed() { return stateChar_.subscribed(); }
 
 private:
-    GattConfigurator() : 
-        stepMasterService_(BLEConfig::SERVICE_UUID),
-        // Max 15 bytes string length - highly optimized
-        stepsChar_(BLEConfig::CHAR_STEPS_UUID, BLERead | BLENotify, 15),
-        jumpsChar_(BLEConfig::CHAR_JUMPS_UUID, BLERead | BLENotify, 15),
-        stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify, 15),
-        stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify, 15),
-        batteryService_(BLEConfig::BATTERY_SERVICE_UUID),
-        batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify),
-        stepsNameDescriptor_("2901", "Step Count"),
-        jumpsNameDescriptor_("2901", "Jump Count"),
-        stairsNameDescriptor_("2901", "Stair Count"),
-        stateNameDescriptor_("2901", "Motion State") {}
-
     BLEService stepMasterService_;
     BLEStringCharacteristic stepsChar_;
     BLEStringCharacteristic jumpsChar_;

@@ -4,22 +4,26 @@
 #include <cstdint>
 #include "params/MotionState.h"
 #include "sensors/MotionFeatures.h"
-#include "utils/SlidingWindow.hpp"
+#include "utils/TimeGuard.hpp"
+#include "config/AlgoConfig.hpp"
 
 class BaseMotion {
 public:
     BaseMotion(MotionState type) : type_(type), count_(0) {}
     virtual ~BaseMotion() = default;
 
-    MotionState evaluate(const MotionFeatures& features, const SlidingWindow& window) {
-        if (!preConditionMet(features, window)) {
+    MotionState evaluate(const MotionFeatures& features, const AlgoConfig& config) {
+        // Shared debounce handling eliminates duplicated logic across all child detectors.
+        if (!timeGuard_.isReady(features.timestampMs)) {
             return MotionState::IDLE;
         }
 
-        if (detectSpecificMotion(features, window)) {
+        if (detectSpecificMotion(features, config)) {
+            timeGuard_.setCooldown(features.timestampMs, config.stepRefractoryMs);
             count_++;
             return type_;
         }
+        
         return MotionState::IDLE;
     }
 
@@ -28,10 +32,11 @@ public:
     void resetCount() { count_ = 0; }
 
 protected:
-    virtual bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) = 0;
-    virtual bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) = 0;
+    // preConditionMet() is removed entirely. Detectors only implement physical logic.
+    virtual bool detectSpecificMotion(const MotionFeatures& features, const AlgoConfig& config) = 0;
 
 private:
+    TimeGuard timeGuard_;
     MotionState type_;
     uint32_t count_;
 };

@@ -2,7 +2,7 @@
 
 #include "params/AlgoParams.hpp"
 #include "params/BuildFlags.h"
-#include "hal/SampleTimer.h"
+#include "utils/SampleTimer.h"
 
 #include <Arduino.h>
 

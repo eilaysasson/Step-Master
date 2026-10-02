@@ -1,6 +1,6 @@
 // ========================================================================================================
 // File: test_broadcaster_stress_endurance.cpp
-// Purpose: Extreme stress testing of the telemetry broadcaster to prevent radio stack buffer overflows.
+// Purpose: Extreme stress testing of the telemetry broadcaster using Dependency Injection.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -11,7 +11,11 @@
 #include "broadcast/DataBroadcaster.hpp"
 #include "broadcast/BleConnection.hpp"
 
-BLEManager bleManager;
+// Instantiate the injected dependency chain explicitly (No Singletons)
+BleConnection bleConn;
+GattConfigurator bleGatt;
+DataBroadcaster bleBroadcaster(bleGatt, bleConn);
+BLEManager bleManager(bleConn, bleGatt, bleBroadcaster);
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -24,13 +28,13 @@ void test_ble_initialization(void) {
 void test_broadcaster_stress_endurance(void) {
     // Attempt 10,000 rapid characteristic writes, simulating heavy activity
     for (uint32_t i = 1; i <= 10000; i++) {
-        DataBroadcaster::getInstance().updateCounters(i, 0, 0);
+        bleBroadcaster.updateCounters(i, 0, 0);
+        
         // Force the BLE stack to process the queued internal events
         bleManager.poll();
     }
 
-    // FIX: Using .toInt() to convert the BLEStringCharacteristic value back to integers for assertion
-    uint32_t finalSteps = GattConfigurator::getInstance().getStepsChar().value().toInt();
+    uint32_t finalSteps = bleGatt.getStepsChar().value().toInt();
 
     // Verify 100% data integrity post-stress
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(10000, finalSteps, "BLE Broadcaster dropped packets during stress execution.");

@@ -5,38 +5,39 @@
 
 #include <Arduino.h>
 #include <unity.h>
-#include "algorithem/MotionClassifier.h"
+#include "config/AlgoConfig.hpp"
+#include "algorithm/RuleBasedFSMClassifier.hpp"
+#include "algorithm/FeatureExtractor.hpp"
 #include "filter/EmaFilter.hpp"
 #include "detectors/StepMotion.hpp"
 #include "detectors/JumpMotion.hpp"
 #include "detectors/StairMotion.hpp"
 #include "TestHelpers.h"
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Marathon Stress (1000 Steps)
-// ----------------------------------------------------------------------------------------------------
 void test_marathon_stress_1000_steps() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StepMotion stepDetector;
+    
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
     for (int i = 0; i < 1000; i++) {
-        injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
+        injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f);
     }
 
     TEST_ASSERT_EQUAL(1000, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Complex Triathlon (Walk -> Stairs -> Jump)
-// ----------------------------------------------------------------------------------------------------
 void test_complex_triathlon_transitions() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StepMotion stepDetector;
     JumpMotion jumpDetector;
     StairMotion stairDetector;
@@ -46,26 +47,22 @@ void test_complex_triathlon_transitions() {
     classifier.addDetector(&stepDetector);
 
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // 2 Steps (Pitch 0)
-    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
-    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f);
     
-    // 3 Stairs (Pitch 45)
-    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
-    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
-    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.0f, 1.0f);
 
-    // 1 Jump (Pitch 76)
-    injectKinematicPeak(classifier, clockMs, 2.0f, 0.5f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 2.0f, 0.5f);
 
     TEST_ASSERT_EQUAL(2, stepDetector.getCount());
     TEST_ASSERT_EQUAL(3, stairDetector.getCount());
     TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
 

@@ -40,27 +40,23 @@ bool Mpu6050Sensor::read(MotionData& out) {
 
     sensors_event_t a, g, temp;
     
-    // Fetch fresh data from the physical I2C sensor
     if (!mpu.getEvent(&a, &g, &temp)) {
         ++i2cErrors_;
         return false;
     }
 
-    // Convert m/s^2 to standard G units (1G = 9.80665 m/s^2)
     out.accelX = a.acceleration.x / 9.80665f;
     out.accelY = a.acceleration.y / 9.80665f;
     out.accelZ = a.acceleration.z / 9.80665f;
     
-    // Convert radians/s to degrees/s
     out.gyroX = g.gyro.x * 57.2958f;
     out.gyroY = g.gyro.y * 57.2958f;
     out.gyroZ = g.gyro.z * 57.2958f;
     
-    // Assign sequential ID and increment
     out.sequence = sequence_++;
     
-    // Timestamp is explicitly handled by the main loop hardware timer
-    out.timestampMs = 0;
+    // FIX: Hardware driver explicitly sets the timestamp upon successful I2C read
+    out.timestampMs = millis();
 
     return true;
 }

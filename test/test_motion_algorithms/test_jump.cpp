@@ -5,73 +5,71 @@
 
 #include <Arduino.h>
 #include <unity.h>
-#include "algorithem/MotionClassifier.h"
+#include "config/AlgoConfig.hpp"
+#include "algorithm/RuleBasedFSMClassifier.hpp"
+#include "algorithm/FeatureExtractor.hpp"
 #include "filter/EmaFilter.hpp"
 #include "detectors/JumpMotion.hpp"
 #include "detectors/StepMotion.hpp"
 #include "TestHelpers.h"
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Standard Knees-to-Chest Jump (Pitch ~ 71.5 degrees)
-// ----------------------------------------------------------------------------------------------------
 void test_knees_to_chest_jump() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     JumpMotion jumpDetector;
+    
     classifier.addDetector(&jumpDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // ax=1.5, az=0.5 generates ~71.5 degrees of pitch. Safely above the 65.0 boundary.
-    injectKinematicPeak(classifier, clockMs, 1.5f, 0.5f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.5f, 0.5f);
 
     TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Ballet / Soccer High Kick (Pitch ~ 84 degrees)
-// ----------------------------------------------------------------------------------------------------
 void test_high_kick_triggers_jump() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     JumpMotion jumpDetector;
     StepMotion stepDetector;
+    
     classifier.addDetector(&jumpDetector);
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // ax=2.0, az=0.2 generates ~84 degrees of extreme pitch rotation.
-    injectKinematicPeak(classifier, clockMs, 2.0f, 0.2f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 2.0f, 0.2f);
 
     TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
     TEST_ASSERT_EQUAL(0, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Hard Flat Landing Rejected as Jump (Pitch 0)
-// ----------------------------------------------------------------------------------------------------
 void test_flat_hard_landing_is_not_jump() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     JumpMotion jumpDetector;
     StepMotion stepDetector;
+    
     classifier.addDetector(&jumpDetector);
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // Massive impact (multiplier 4.0 = ~4.0g) but leg is entirely flat (pitch 0).
-    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f, 4.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f, 4.0f);
 
     TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
     TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
 

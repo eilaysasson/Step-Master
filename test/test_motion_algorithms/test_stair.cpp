@@ -1,56 +1,55 @@
 // ========================================================================================================
 // File: test_stair.cpp
-// Purpose: Validates mid-pitch kinematics (25 <= Pitch < 65) routing strictly to the Stair detector.
+// Purpose: Validates mid-pitch kinematics routing strictly to the Stair detector.
 // ========================================================================================================
 
 #include <Arduino.h>
 #include <unity.h>
-#include "algorithem/MotionClassifier.h"
+#include "config/AlgoConfig.hpp"
+#include "algorithm/RuleBasedFSMClassifier.hpp"
+#include "algorithm/FeatureExtractor.hpp"
 #include "filter/EmaFilter.hpp"
 #include "detectors/StairMotion.hpp"
 #include "detectors/StepMotion.hpp"
 #include "TestHelpers.h"
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Valid Stair Climb (Pitch ~ 45 degrees)
-// ----------------------------------------------------------------------------------------------------
 void test_valid_stair_climb() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StairMotion stairDetector;
+    
     classifier.addDetector(&stairDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // ax=1.0, az=1.0 generates exactly 45 degrees of pitch. Fits perfectly in the 25-65 bounds.
-    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.0f, 1.0f);
 
     TEST_ASSERT_EQUAL(1, stairDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: High Energy Flat Walk Rejected as Stairs
-// ----------------------------------------------------------------------------------------------------
 void test_high_energy_flat_walk_rejected_as_stairs() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StairMotion stairDetector;
     StepMotion stepDetector;
+    
     classifier.addDetector(&stairDetector);
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // Extreme impact (multiplier 3.5 = ~3.5g) but 0 degrees pitch. Should route to STEP.
-    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f, 3.5f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f, 3.5f);
 
     TEST_ASSERT_EQUAL(0, stairDetector.getCount());
     TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
 

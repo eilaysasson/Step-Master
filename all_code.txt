@@ -3,203 +3,60 @@
 
 // ========================================================================================================
 // File: main.cpp
-// Purpose: Production composition root. Wires hardware sensors, ISR timers, ring buffers, streaming, 
-// the DSP classification engine, and the BLE Manager into a non-blocking 100Hz pipeline.
+// Purpose: The absolute entry point. Instantiates the System Manager and delegates all execution.
 // ========================================================================================================
 
 #include <Arduino.h>
 
 #ifndef PIO_UNIT_TESTING
 
-#include "params/AlgoParams.hpp"
-#include "config/HardwareConfig.hpp"
-#include "params/BuildFlags.h"
+#include "service/SystemManager.hpp"
 
-#include "hal/SampleTimer.h"
-#include "buffers/RingBuffer.hpp"
-#include "streaming/SerialStreamer.h"
-#include "streaming/DebugCli.h"
-#include "streaming/BLEManager.h" 
-
-#include "algorithem/MotionClassifier.h"
-#include "filter/EmaFilter.hpp"
-#include "detectors/StepMotion.hpp"
-#include "detectors/JumpMotion.hpp"
-#include "detectors/StairMotion.hpp"
-
-#if USE_MOCK_SENSOR
-#include "sensors/MockSensor.h"
-MotionSensor* sensor = getSensor();
-#else
-#include "drivers/Mpu6050Sensor.h"
-Mpu6050Sensor hardwareSensor;
-MotionSensor* sensor = &hardwareSensor;
-#endif
-
-SampleTimer sampleTimer;
-SampleRingBuffer<AlgoParams::RING_BUFFER_CAPACITY> ringBuffer;
-SerialStreamer streamer;
-DebugCli cli;
-BLEManager bleFacade; 
-
-EmaFilter mainFilter(0.53f);
-MotionClassifier classifier(&mainFilter);
-StepMotion stepDetector;
-JumpMotion jumpDetector;
-StairMotion stairDetector;
-
-uint32_t totalSamplesProcessed = 0;
-uint32_t ledTurnOffTimestampMs = 0;
-bool isLedActive = false;
-uint32_t globalSequence = 0; 
+// The central controller that manages all hardware, logic, and communications
+SystemManager appManager;
 
 void setup() {
-    Serial.begin(AlgoParams::SERIAL_BAUD);
-    delay(2000);
-
-    Serial.println("=================================================");
-    Serial.println("StepMaster Ankle Motion Tracker - Initializing...");
-    Serial.println("=================================================");
-
-    pinMode(HardwareConfig::LED_PIN, OUTPUT);
-    digitalWrite(HardwareConfig::LED_PIN, HardwareConfig::LED_OFF);
-
-    streamer.begin();
-    cli.begin(&streamer);
-    bleFacade.begin(); 
-
-    classifier.addDetector(&jumpDetector);
-    classifier.addDetector(&stairDetector);
-    classifier.addDetector(&stepDetector);
-
-    if (!sensor->begin()) {
-        Serial.println("[ERROR] Sensor initialization failed! Check I2C wiring.");
-        while (true) { delay(100); }
-    }
-    
-    Serial.println("[INFO] Sensor initialized successfully.");
-
-    if (!sampleTimer.begin(AlgoParams::SAMPLE_INTERVAL_US)) {
-        Serial.println("[ERROR] Failed to start hardware timer.");
-        while (true) { delay(100); }
-    }
-
-    Serial.println("[INFO] Timer running at 100Hz. Entering main monitoring loop...");
+    // Tell the manager to bootstrap the system
+    appManager.begin();
 }
 
 void loop() {
-    cli.poll();
-    bleFacade.poll(); 
-
-    if (sampleTimer.consumeSample()) {
-        MotionData rawData;
-        if (sensor->read(rawData)) {
-            RawSample rSample;
-            rSample.sequence = globalSequence++;
-            rSample.timestampMs = millis(); 
-            rSample.ax = rawData.accelX;
-            rSample.ay = rawData.accelY;
-            rSample.az = rawData.accelZ;
-            rSample.gx = rawData.gyroX;
-            rSample.gy = rawData.gyroY;
-            rSample.gz = rawData.gyroZ;
-
-            ringBuffer.push(rSample);
-        }
-    }
-
-    while (!ringBuffer.empty()) {
-        RawSample currentSample;
-        ringBuffer.pop(currentSample);
-
-        streamer.streamSample(currentSample);
-
-        MotionData mData;
-        mData.timestampMs = currentSample.timestampMs;
-        mData.sequence = currentSample.sequence;
-        mData.accelX = currentSample.ax;
-        mData.accelY = currentSample.ay;
-        mData.accelZ = currentSample.az;
-        mData.gyroX = currentSample.gx;
-        mData.gyroY = currentSample.gy;
-        mData.gyroZ = currentSample.gz;
-
-        MotionState currentState = classifier.update(mData);
-
-        if (currentState != MotionState::IDLE && currentState != MotionState::NOISE) {
-            digitalWrite(HardwareConfig::LED_PIN, HardwareConfig::LED_ON);
-            ledTurnOffTimestampMs = millis() + AlgoParams::LED_PULSE_DURATION_MS;
-            isLedActive = true;
-
-            Serial.print("[EVENT] Time: "); Serial.print(mData.timestampMs);
-            Serial.print(" | State: "); Serial.print(static_cast<int>(currentState));
-            Serial.print(" | Steps: "); Serial.print(stepDetector.getCount());
-            Serial.print(" | Jumps: "); Serial.print(jumpDetector.getCount());
-            Serial.print(" | Stairs: "); Serial.println(stairDetector.getCount());
-            
-            // Send the raw data to the Facade directly. 
-            // The BLE Broadcaster Singleton handles change-detection and TX buffer protection internally.
-            bleFacade.updateTelemetry(currentState, stepDetector.getCount(), jumpDetector.getCount(), stairDetector.getCount()); 
-        }
-
-        totalSamplesProcessed++;
-    }
-
-    if (isLedActive && millis() >= ledTurnOffTimestampMs) {
-        digitalWrite(HardwareConfig::LED_PIN, HardwareConfig::LED_OFF);
-        isLedActive = false;
-    }
-
-    uint32_t currentI2cErrors = sensor->i2cErrorCount();
-    cli.setSampleCount(totalSamplesProcessed);
-    cli.setI2cErrors(currentI2cErrors);
-    streamer.maybePrintStats(totalSamplesProcessed, currentI2cErrors);
+    // Tell the manager to execute one cycle of the pipeline
+    appManager.run();
 }
 
 #endif // PIO_UNIT_TESTING
 
-===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\algorithem\MotionClassifier.cpp =====
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\algorithm\RuleBasedFSMClassifier.cpp =====
 
-//===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\algorithem\MotionClassifier.cpp =====
+// ========================================================================================================
+// File: RuleBasedFSMClassifier.cpp
+// Purpose: Implementation of the stateless, rule-based decision engine.
+// ========================================================================================================
 
-#include "algorithem/MotionClassifier.h"
-#include "params/AlgoParams.hpp"
-#include <cmath>
+#include "algorithm/RuleBasedFSMClassifier.hpp"
 
-MotionClassifier::MotionClassifier(IFilter* filter) 
-    : magnitudeFilter_(filter), detectorCount_(0), currentPitch_(0.0f) {
-}
-
-void MotionClassifier::addDetector(BaseMotion* detector) {
-    if (detectorCount_ < MAX_DETECTORS) {
-        detectors_[detectorCount_] = detector;
-        detectorCount_++;
+RuleBasedFSMClassifier::RuleBasedFSMClassifier() : detectorCount_(0) {
+    for (uint8_t i = 0; i < MAX_DETECTORS; i++) {
+        detectors_[i] = nullptr;
     }
 }
 
-MotionState MotionClassifier::update(const MotionData& rawData) {
-    float rawMag = std::sqrt((rawData.accelX * rawData.accelX) + 
-                             (rawData.accelY * rawData.accelY) + 
-                             (rawData.accelZ * rawData.accelZ));
+void RuleBasedFSMClassifier::addDetector(BaseMotion* detector) {
+    if (detectorCount_ < MAX_DETECTORS) {
+        detectors_[detectorCount_++] = detector;
+    }
+}
 
-    float smoothMag = magnitudeFilter_->process(rawMag);
-
-    // Calculate kinematic pitch using a Complementary Filter (96% Gyro, 4% Accel)
-    float dtSeconds = AlgoParams::SAMPLE_INTERVAL_US / 1000000.0f;
-    float accelPitch = std::atan2(rawData.accelX, std::sqrt((rawData.accelY * rawData.accelY) + (rawData.accelZ * rawData.accelZ))) * 57.2958f;
-    currentPitch_ = 0.96f * (currentPitch_ + rawData.gyroY * dtSeconds) + 0.04f * accelPitch;
-
-    slidingWindow_.push(smoothMag);
-
-    MotionFeatures features = {rawMag, smoothMag, currentPitch_, rawData.timestampMs};
-
+MotionState RuleBasedFSMClassifier::evaluate(const MotionFeatures& features, const AlgoConfig& config) {
     for (uint8_t i = 0; i < detectorCount_; i++) {
-        MotionState evaluatedState = detectors_[i]->evaluate(features, slidingWindow_);
-        if (evaluatedState != MotionState::IDLE && evaluatedState != MotionState::NOISE) {
-            return evaluatedState;
+        if (detectors_[i] != nullptr) {
+            MotionState state = detectors_[i]->evaluate(features, config);
+            if (state != MotionState::IDLE) {
+                return state;
+            }
         }
     }
-
     return MotionState::IDLE;
 }
 
@@ -247,27 +104,23 @@ bool Mpu6050Sensor::read(MotionData& out) {
 
     sensors_event_t a, g, temp;
     
-    // Fetch fresh data from the physical I2C sensor
     if (!mpu.getEvent(&a, &g, &temp)) {
         ++i2cErrors_;
         return false;
     }
 
-    // Convert m/s^2 to standard G units (1G = 9.80665 m/s^2)
     out.accelX = a.acceleration.x / 9.80665f;
     out.accelY = a.acceleration.y / 9.80665f;
     out.accelZ = a.acceleration.z / 9.80665f;
     
-    // Convert radians/s to degrees/s
     out.gyroX = g.gyro.x * 57.2958f;
     out.gyroY = g.gyro.y * 57.2958f;
     out.gyroZ = g.gyro.z * 57.2958f;
     
-    // Assign sequential ID and increment
     out.sequence = sequence_++;
     
-    // Timestamp is explicitly handled by the main loop hardware timer
-    out.timestampMs = 0;
+    // FIX: Hardware driver explicitly sets the timestamp upon successful I2C read
+    out.timestampMs = millis();
 
     return true;
 }
@@ -277,57 +130,6 @@ uint32_t Mpu6050Sensor::i2cErrorCount() const {
 }
 
 #endif // !USE_MOCK_SENSOR
-
-===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\hal\SampleTimer.cpp =====
-
-#include "hal/SampleTimer.h"
-#include <Arduino.h>
-#include <NRF52_MBED_TimerInterrupt.h>
-
-volatile bool g_sampleDue = false;
-volatile uint32_t g_expectedTicks = 0;
-volatile uint32_t g_sampleDrops = 0;
-
-namespace {
-    NRF52_MBED_Timer sampleTimer(NRF_TIMER_3);
-
-    void onSampleTick() {
-        if (g_sampleDue) {
-            g_sampleDrops++;
-        }
-        g_sampleDue = true;
-        g_expectedTicks++;
-    }
-}
-
-bool SampleTimer::begin(uint32_t intervalUs) {
-    if (started_) return true;
-    
-    g_sampleDue = false;
-    g_expectedTicks = 0;
-    g_sampleDrops = 0;
-
-    started_ = sampleTimer.attachInterruptInterval(intervalUs, onSampleTick);
-    return started_;
-}
-
-void SampleTimer::end() {
-    if (!started_) return;
-    sampleTimer.detachInterrupt();
-    started_ = false;
-}
-
-bool SampleTimer::consumeSample() {
-    // Atomic read-and-clear to prevent race conditions with the hardware timer ISR.
-    noInterrupts();
-    if (!g_sampleDue) {
-        interrupts();
-        return false;
-    }
-    g_sampleDue = false;
-    interrupts();
-    return true;
-}
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\sensors\MockSensor.cpp =====
 
@@ -407,41 +209,198 @@ void processMotion(MotionData data)
     (void)data;
 }
 
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\service\SystemManager.cpp =====
+
+// ========================================================================================================
+// File: SystemManager.cpp
+// Purpose: Implementation of the Application Controller. Instantiates all dependencies, wires them
+// together, and runs the continuous hardware pipeline.
+// ========================================================================================================
+
+#include "service/SystemManager.hpp"
+#include <Arduino.h>
+
+#if USE_MOCK_SENSOR
+#include "sensors/MockSensor.h"
+#else
+#include "drivers/Mpu6050Sensor.h"
+#endif
+
+// ----------------------------------------------------------------------------------------------------
+// Constructor: Wires the dependencies together using constructor injection
+// ----------------------------------------------------------------------------------------------------
+SystemManager::SystemManager() 
+    : bleBroadcaster_(bleGatt_, bleConn_),
+      bleFacade_(bleConn_, bleGatt_, bleBroadcaster_),
+      mainFilter_(AlgoParams::EMA_ALPHA), // Removed Magic Number: Now using AlgoParams::EMA_ALPHA
+      featureExtractor_(&mainFilter_),
+      fsmEngine_(),
+      classifier_(&fsmEngine_), // Bind the abstract interface to the concrete implementation
+      totalSamplesProcessed_(0),
+      ledTurnOffTimestampMs_(0),
+      isLedActive_(false),
+      globalSequence_(0) 
+{
+#if USE_MOCK_SENSOR
+    sensor_ = getSensor();
+#else
+    static Mpu6050Sensor hardwareSensor;
+    sensor_ = &hardwareSensor;
+#endif
+}
+
+void SystemManager::begin() {
+    Serial.begin(AlgoParams::SERIAL_BAUD);
+    delay(2000); 
+
+    Serial.println("=================================================");
+    Serial.println("StepMaster Ankle Motion Tracker - Initializing...");
+    Serial.println("=================================================");
+
+    pinMode(HardwareConfig::LED_PIN, OUTPUT);
+    digitalWrite(HardwareConfig::LED_PIN, HardwareConfig::LED_OFF);
+
+    streamer_.begin();
+    cli_.begin(&streamer_);
+    bleFacade_.begin(); 
+
+    // Register detectors into the concrete FSM engine
+    fsmEngine_.addDetector(&jumpDetector_);
+    fsmEngine_.addDetector(&stairDetector_);
+    fsmEngine_.addDetector(&stepDetector_);
+
+    if (!sensor_->begin()) {
+        Serial.println("[ERROR] Sensor initialization failed! Check I2C wiring.");
+        while (true) { delay(100); }
+    }
+    Serial.println("[INFO] Sensor initialized successfully.");
+
+    if (!sampleTimer_.begin(AlgoParams::SAMPLE_INTERVAL_US)) {
+        Serial.println("[ERROR] Failed to start hardware timer.");
+        while (true) { delay(100); }
+    }
+
+    Serial.println("[INFO] System Manager Ready. Running Main Loop...");
+}
+
+void SystemManager::run() {
+    cli_.poll();
+    bleFacade_.poll(); 
+
+    fetchSensorData();
+    processBuffer();
+
+    if (isLedActive_ && millis() >= ledTurnOffTimestampMs_) {
+        digitalWrite(HardwareConfig::LED_PIN, HardwareConfig::LED_OFF);
+        isLedActive_ = false;
+    }
+
+    uint32_t currentI2cErrors = sensor_->i2cErrorCount();
+    cli_.setSampleCount(totalSamplesProcessed_);
+    cli_.setI2cErrors(currentI2cErrors);
+    streamer_.maybePrintStats(totalSamplesProcessed_, currentI2cErrors);
+}
+
+void SystemManager::fetchSensorData() {
+    if (sampleTimer_.consumeSample()) {
+        MotionData rawData;
+        if (sensor_->read(rawData)) {
+            RawSample rSample;
+            rSample.sequence = globalSequence_++;
+            rSample.timestampMs = rawData.timestampMs; 
+            rSample.ax = rawData.accelX;
+            rSample.ay = rawData.accelY;
+            rSample.az = rawData.accelZ;
+            rSample.gx = rawData.gyroX;
+            rSample.gy = rawData.gyroY;
+            rSample.gz = rawData.gyroZ;
+
+            ringBuffer_.push(rSample);
+        }
+    }
+}
+
+void SystemManager::processBuffer() {
+    while (!ringBuffer_.empty()) {
+        RawSample currentSample;
+        ringBuffer_.pop(currentSample);
+
+        streamer_.streamSample(currentSample);
+
+        MotionData mData;
+        mData.timestampMs = currentSample.timestampMs;
+        mData.sequence = currentSample.sequence;
+        mData.accelX = currentSample.ax;
+        mData.accelY = currentSample.ay;
+        mData.accelZ = currentSample.az;
+        mData.gyroX = currentSample.gx;
+        mData.gyroY = currentSample.gy;
+        mData.gyroZ = currentSample.gz;
+
+        MotionFeatures features = featureExtractor_.process(mData);
+        
+        // Execute classification cleanly through the abstract IClassifier interface
+        MotionState currentState = classifier_->evaluate(features, config_);
+
+        if (currentState != MotionState::IDLE && currentState != MotionState::NOISE) {
+            handleVisualFeedback(currentState);
+
+            uint32_t currentSteps = stepDetector_.getCount();
+            uint32_t currentJumps = jumpDetector_.getCount();
+            uint32_t currentStairs = stairDetector_.getCount();
+
+            bleFacade_.updateTelemetry(currentState, currentSteps, currentJumps, currentStairs); 
+        }
+
+        totalSamplesProcessed_++;
+    }
+}
+
+void SystemManager::handleVisualFeedback(MotionState currentState) {
+    digitalWrite(HardwareConfig::LED_PIN, HardwareConfig::LED_ON);
+    ledTurnOffTimestampMs_ = millis() + AlgoParams::LED_PULSE_DURATION_MS;
+    isLedActive_ = true;
+
+    Serial.print("[EVENT] State: "); Serial.print(static_cast<int>(currentState));
+    Serial.print(" | Steps: "); Serial.print(stepDetector_.getCount());
+    Serial.print(" | Jumps: "); Serial.print(jumpDetector_.getCount());
+    Serial.print(" | Stairs: "); Serial.println(stairDetector_.getCount());
+}
+
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\streaming\BLEManager.cpp =====
 
 // ========================================================================================================
 // File: BLEManager.cpp
-// Purpose: Implementation of the BLEManager Facade orchestrating the underlying Singleton components.
+// Purpose: Implementation of the BLEManager Facade orchestrating the injected components.
 // ========================================================================================================
 
 #include "streaming/BLEManager.h"
-#include "broadcast/BleConnection.hpp"
-#include "broadcast/GattConfigurator.hpp"
-#include "broadcast/DataBroadcaster.hpp"
 #include <Arduino.h>
 
+BLEManager::BLEManager(BleConnection& conn, GattConfigurator& gatt, DataBroadcaster& broadcaster)
+    : conn_(conn), gatt_(gatt), broadcaster_(broadcaster) {}
+
 bool BLEManager::begin() {
-    if (!BleConnection::getInstance().begin()) {
+    if (!conn_.begin()) {
         Serial.println("[ERROR] BLE radio initialization failed!");
         return false;
     }
 
-    GattConfigurator::getInstance().setupServices();
-    BleConnection::getInstance().startAdvertising();
+    gatt_.setupServices();
+    conn_.startAdvertising();
 
     Serial.println("[INFO] BLE Facade initialized successfully. Advertising...");
     return true;
 }
 
 void BLEManager::poll() {
-    BleConnection::getInstance().poll();
+    conn_.poll();
 }
 
 void BLEManager::updateTelemetry(MotionState state, uint32_t steps, uint32_t jumps, uint32_t stairs) {
-    if (BleConnection::getInstance().isConnected()) {
-        // DataBroadcaster now internally handles state-tracking, subscription validation, and stack polling
-        DataBroadcaster::getInstance().updateState(state);
-        DataBroadcaster::getInstance().updateCounters(steps, jumps, stairs);
+    if (conn_.isConnected()) {
+        broadcaster_.updateState(state);
+        broadcaster_.updateCounters(steps, jumps, stairs);
     }
 }
 
@@ -450,7 +409,7 @@ void BLEManager::updateTelemetry(MotionState state, uint32_t steps, uint32_t jum
 #include "streaming/DebugCli.h"
 
 #include "params/BuildFlags.h"
-#include "hal/SampleTimer.h"
+#include "utils/SampleTimer.h"
 #include "streaming/SerialStreamer.h"
 
 #include <Arduino.h>
@@ -604,7 +563,7 @@ void DebugCli::printRate() const
 
 #include "params/AlgoParams.hpp"
 #include "params/BuildFlags.h"
-#include "hal/SampleTimer.h"
+#include "utils/SampleTimer.h"
 
 #include <Arduino.h>
 
@@ -680,6 +639,57 @@ void SerialStreamer::maybePrintStats(uint32_t& samplesSinceLastStat, uint32_t i2
     samplesSinceLastStat = 0;
 }
 
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\utils\SampleTimer.cpp =====
+
+#include "utils/SampleTimer.h"
+#include <Arduino.h>
+#include <NRF52_MBED_TimerInterrupt.h>
+
+volatile bool g_sampleDue = false;
+volatile uint32_t g_expectedTicks = 0;
+volatile uint32_t g_sampleDrops = 0;
+
+namespace {
+    NRF52_MBED_Timer sampleTimer(NRF_TIMER_3);
+
+    void onSampleTick() {
+        if (g_sampleDue) {
+            g_sampleDrops++;
+        }
+        g_sampleDue = true;
+        g_expectedTicks++;
+    }
+}
+
+bool SampleTimer::begin(uint32_t intervalUs) {
+    if (started_) return true;
+    
+    g_sampleDue = false;
+    g_expectedTicks = 0;
+    g_sampleDrops = 0;
+
+    started_ = sampleTimer.attachInterruptInterval(intervalUs, onSampleTick);
+    return started_;
+}
+
+void SampleTimer::end() {
+    if (!started_) return;
+    sampleTimer.detachInterrupt();
+    started_ = false;
+}
+
+bool SampleTimer::consumeSample() {
+    // Atomic read-and-clear to prevent race conditions with the hardware timer ISR.
+    noInterrupts();
+    if (!g_sampleDue) {
+        interrupts();
+        return false;
+    }
+    g_sampleDue = false;
+    interrupts();
+    return true;
+}
+
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\src\utils\SlidingWindow.cpp =====
 
 #include "utils/SlidingWindow.hpp"
@@ -736,46 +746,123 @@ void SlidingWindow::clear() {
     sumSq_ = 0.0f;
 }
 
-===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\algorithem\MotionClassifier.h =====
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\algorithm\FeatureExtractor.hpp =====
 
-//===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\algorithem\MotionClassifier.h =====
+// ========================================================================================================
+// File: FeatureExtractor.hpp
+// Purpose: Dedicated DSP pipeline executing filtering, windowing, and peak detection prior to classification.
+// ========================================================================================================
 
-#ifndef MOTION_CLASSIFIER_H
-#define MOTION_CLASSIFIER_H
+#ifndef FEATURE_EXTRACTOR_HPP
+#define FEATURE_EXTRACTOR_HPP
 
-#include <cstdint>
 #include "sensors/MotionSensor.h"
-#include "params/MotionState.h"
 #include "sensors/MotionFeatures.h"
 #include "filter/IFilter.hpp"
 #include "utils/SlidingWindow.hpp"
-#include "detectors/BaseMotion.hpp"
+#include "utils/PeakDetector.hpp"
+#include "params/AlgoParams.hpp"
+#include <cmath>
 
-class MotionClassifier {
+class FeatureExtractor {
 public:
-    MotionClassifier(IFilter* filter);
-    void addDetector(BaseMotion* detector);
-    MotionState update(const MotionData& rawData);
+    FeatureExtractor(IFilter* filter) : magnitudeFilter_(filter), currentPitch_(0.0f) {}
+
+    MotionFeatures process(const MotionData& rawData) {
+        float rawMag = std::sqrt((rawData.accelX * rawData.accelX) + 
+                                 (rawData.accelY * rawData.accelY) + 
+                                 (rawData.accelZ * rawData.accelZ));
+
+        float smoothMag = magnitudeFilter_->process(rawMag);
+
+        float dtSeconds = AlgoParams::SAMPLE_INTERVAL_US / 1000000.0f;
+        float accelPitch = std::atan2(rawData.accelX, std::sqrt((rawData.accelY * rawData.accelY) + (rawData.accelZ * rawData.accelZ))) * 57.2958f;
+        
+        // Removed Magic Numbers: Now using parameters from AlgoParams
+        currentPitch_ = AlgoParams::PITCH_GYRO_WEIGHT * (currentPitch_ + rawData.gyroY * dtSeconds) + AlgoParams::PITCH_ACCEL_WEIGHT * accelPitch;
+
+        slidingWindow_.push(smoothMag);
+        
+        float currentPeakValue = 0.0f;
+        bool currentIsPeak = peakDetector_.update(smoothMag, currentPeakValue);
+
+        return {
+            rawMag, smoothMag, currentPitch_, rawData.timestampMs,
+            slidingWindow_.getMean(), slidingWindow_.getStdDev(),
+            currentIsPeak, currentPeakValue
+        };
+    }
 
 private:
     IFilter* magnitudeFilter_;
     SlidingWindow slidingWindow_;
-    
-    static const uint8_t MAX_DETECTORS = 5;
-    BaseMotion* detectors_[MAX_DETECTORS];
-    uint8_t detectorCount_;
-    
+    PeakDetector peakDetector_;
     float currentPitch_;
 };
 
-#endif // MOTION_CLASSIFIER_H
+#endif // FEATURE_EXTRACTOR_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\algorithm\IClassifier.hpp =====
+
+// ========================================================================================================
+// File: IClassifier.hpp
+// Purpose: Pure abstract interface for motion classification. Ensures the Open/Closed Principle 
+// by decoupling the classification engine from the surrounding hardware and BLE pipelines.
+// ========================================================================================================
+
+#ifndef I_CLASSIFIER_HPP
+#define I_CLASSIFIER_HPP
+
+#include "params/MotionState.h"
+#include "sensors/MotionFeatures.h"
+#include "config/AlgoConfig.hpp"
+
+class IClassifier {
+public:
+    virtual ~IClassifier() = default;
+
+    // ----------------------------------------------------------------------------------------------------
+    // Method: evaluate
+    // Purpose: Takes fully extracted features and dynamic configuration, returning a classified state.
+    // ----------------------------------------------------------------------------------------------------
+    virtual MotionState evaluate(const MotionFeatures& features, const AlgoConfig& config) = 0;
+};
+
+#endif // I_CLASSIFIER_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\algorithm\RuleBasedFSMClassifier.hpp =====
+
+// ========================================================================================================
+// File: RuleBasedFSMClassifier.hpp
+// Purpose: Concrete implementation of IClassifier utilizing polymorphic FSM detectors (Step, Jump, Stair).
+// ========================================================================================================
+
+#ifndef RULE_BASED_FSM_CLASSIFIER_HPP
+#define RULE_BASED_FSM_CLASSIFIER_HPP
+
+#include <cstdint>
+#include "algorithm/IClassifier.hpp"
+#include "detectors/BaseMotion.hpp"
+
+class RuleBasedFSMClassifier : public IClassifier {
+public:
+    RuleBasedFSMClassifier();
+    
+    // Registers a polymorphic motion detector into the priority array
+    void addDetector(BaseMotion* detector);
+
+    // Fulfills the IClassifier contract
+    MotionState evaluate(const MotionFeatures& features, const AlgoConfig& config) override;
+
+private:
+    static const uint8_t MAX_DETECTORS = 5;
+    BaseMotion* detectors_[MAX_DETECTORS];
+    uint8_t detectorCount_;
+};
+
+#endif // RULE_BASED_FSM_CLASSIFIER_HPP
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\broadcast\BleConnection.hpp =====
-
-// ========================================================================================================
-// File: BleConnection.hpp
-// Purpose: Singleton class managing the physical BLE radio state, connections, and advertising.
-// ========================================================================================================
 
 #ifndef BLE_CONNECTION_HPP
 #define BLE_CONNECTION_HPP
@@ -785,102 +872,64 @@ private:
 
 class BleConnection {
 public:
-    // ----------------------------------------------------------------------------------------------------
-    // Method: getInstance
-    // Purpose: Returns the single, globally accessible instance of the BleConnection class.
-    // ----------------------------------------------------------------------------------------------------
-    static BleConnection& getInstance() {
-        static BleConnection instance;
-        return instance;
-    }
+    BleConnection() = default;
 
-    // Delete copy constructor and assignment operator to enforce Singleton pattern
-    BleConnection(const BleConnection&) = delete;
-    BleConnection& operator=(const BleConnection&) = delete;
-
-    // ----------------------------------------------------------------------------------------------------
-    // Method: begin
-    // Purpose: Initializes the physical BLE module and sets the local device name.
-    // ----------------------------------------------------------------------------------------------------
     bool begin() {
-        if (!BLE.begin()) {
-            return false;
-        }
+        if (!BLE.begin()) return false;
         BLE.setLocalName(BLEConfig::DEVICE_NAME);
         return true;
     }
 
-    // ----------------------------------------------------------------------------------------------------
-    // Method: startAdvertising
-    // Purpose: Commands the BLE radio to begin broadcasting its presence to central devices.
-    // ----------------------------------------------------------------------------------------------------
-    void startAdvertising() {
-        BLE.advertise();
-    }
-
-    // ----------------------------------------------------------------------------------------------------
-    // Method: poll
-    // Purpose: Polls the BLE hardware for new connection events and data requests.
-    // ----------------------------------------------------------------------------------------------------
-    void poll() {
-        BLE.poll();
-    }
-
-    // ----------------------------------------------------------------------------------------------------
-    // Method: isConnected
-    // Purpose: Checks if a central device (like a smartphone) is currently connected to the peripheral.
-    // ----------------------------------------------------------------------------------------------------
+    void startAdvertising() { BLE.advertise(); }
+    void poll() { BLE.poll(); }
     bool isConnected() const {
         BLEDevice central = BLE.central();
         return central && central.connected();
     }
-
-private:
-    // Private constructor to prevent external instantiation
-    BleConnection() = default;
 };
 
 #endif // BLE_CONNECTION_HPP
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\broadcast\DataBroadcaster.hpp =====
 
+// ========================================================================================================
+// File: DataBroadcaster.hpp
+// Purpose: Handles checking for state changes and dispatching updates to the GATT configurator.
+// ========================================================================================================
+
 #ifndef DATA_BROADCASTER_HPP
 #define DATA_BROADCASTER_HPP
 
 #include <cstdint>
 #include <Arduino.h>
-#include "GattConfigurator.hpp"
-#include "BleConnection.hpp"
+#include "broadcast/GattConfigurator.hpp"
+#include "broadcast/BleConnection.hpp"
 #include "params/MotionState.h"
 
 class DataBroadcaster {
 public:
-    static DataBroadcaster& getInstance() {
-        static DataBroadcaster instance;
-        return instance;
-    }
-
-    DataBroadcaster(const DataBroadcaster&) = delete;
-    DataBroadcaster& operator=(const DataBroadcaster&) = delete;
+    // Dependencies injected via constructor
+    DataBroadcaster(GattConfigurator& gatt, BleConnection& ble) 
+        : gatt_(gatt), ble_(ble), lastSteps_(0), lastJumps_(0), lastStairs_(0), lastState_(MotionState::IDLE) {}
 
     void updateCounters(uint32_t steps, uint32_t jumps, uint32_t stairs) {
-        // String conversion happens ONLY when a counter actually changes, ensuring top performance.
         if (steps != lastSteps_) {
-            GattConfigurator::getInstance().getStepsChar().writeValue(String(steps));
+            gatt_.getStepsChar().writeValue(String(steps));
             lastSteps_ = steps;
-            BleConnection::getInstance().poll();
+            ble_.poll();
         }
         
+        // This logic was missing/skipped in your current file
         if (jumps != lastJumps_) {
-            GattConfigurator::getInstance().getJumpsChar().writeValue(String(jumps));
+            gatt_.getJumpsChar().writeValue(String(jumps));
             lastJumps_ = jumps;
-            BleConnection::getInstance().poll();
+            ble_.poll();
         }
         
         if (stairs != lastStairs_) {
-            GattConfigurator::getInstance().getStairsChar().writeValue(String(stairs));
+            gatt_.getStairsChar().writeValue(String(stairs));
             lastStairs_ = stairs;
-            BleConnection::getInstance().poll();
+            ble_.poll();
         }
     }
 
@@ -892,24 +941,29 @@ public:
             else if (state == MotionState::STAIRS) stateStr = "STAIRS";
             else if (state == MotionState::NOISE) stateStr = "NOISE";
 
-            GattConfigurator::getInstance().getStateChar().writeValue(stateStr);
+            gatt_.getStateChar().writeValue(stateStr);
             lastState_ = state;
-            BleConnection::getInstance().poll();
+            ble_.poll();
         }
     }
 
 private:
-    DataBroadcaster() = default;
-
-    uint32_t lastSteps_ = 0;
-    uint32_t lastJumps_ = 0;
-    uint32_t lastStairs_ = 0;
-    MotionState lastState_ = MotionState::IDLE;
+    GattConfigurator& gatt_;
+    BleConnection& ble_;
+    uint32_t lastSteps_;
+    uint32_t lastJumps_;
+    uint32_t lastStairs_;
+    MotionState lastState_;
 };
 
 #endif // DATA_BROADCASTER_HPP
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\broadcast\GattConfigurator.hpp =====
+
+// ========================================================================================================
+// File: GattConfigurator.hpp
+// Purpose: Configures BLE services and characteristics.
+// ========================================================================================================
 
 #ifndef GATT_CONFIGURATOR_HPP
 #define GATT_CONFIGURATOR_HPP
@@ -920,13 +974,18 @@ private:
 
 class GattConfigurator {
 public:
-    static GattConfigurator& getInstance() {
-        static GattConfigurator instance;
-        return instance;
-    }
-
-    GattConfigurator(const GattConfigurator&) = delete;
-    GattConfigurator& operator=(const GattConfigurator&) = delete;
+    GattConfigurator() : 
+        stepMasterService_(BLEConfig::SERVICE_UUID),
+        stepsChar_(BLEConfig::CHAR_STEPS_UUID, BLERead | BLENotify, 15),
+        jumpsChar_(BLEConfig::CHAR_JUMPS_UUID, BLERead | BLENotify, 15),
+        stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify, 15),
+        stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify, 15),
+        batteryService_(BLEConfig::BATTERY_SERVICE_UUID),
+        batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify),
+        stepsNameDescriptor_("2901", "Step Count"),
+        jumpsNameDescriptor_("2901", "Jump Count"),
+        stairsNameDescriptor_("2901", "Stair Count"),
+        stateNameDescriptor_("2901", "Motion State") {}
 
     void setupServices() {
         BLE.setAdvertisedService(stepMasterService_);
@@ -946,15 +1005,13 @@ public:
         batteryService_.addCharacteristic(batteryLevelChar_);
         BLE.addService(batteryService_);
 
-        // Initialize with default readable text values
         stepsChar_.writeValue("0");
         jumpsChar_.writeValue("0");
         stairsChar_.writeValue("0");
         stateChar_.writeValue("IDLE");
-        batteryLevelChar_.writeValue(100);
+        batteryLevelChar_.writeValue(batteryLevelChar_.value());
     }
 
-    // Accessors modified to return BLEStringCharacteristic
     BLEStringCharacteristic& getStepsChar() { return stepsChar_; }
     BLEStringCharacteristic& getJumpsChar() { return jumpsChar_; }
     BLEStringCharacteristic& getStairsChar() { return stairsChar_; }
@@ -966,20 +1023,6 @@ public:
     bool isStateSubscribed() { return stateChar_.subscribed(); }
 
 private:
-    GattConfigurator() : 
-        stepMasterService_(BLEConfig::SERVICE_UUID),
-        // Max 15 bytes string length - highly optimized
-        stepsChar_(BLEConfig::CHAR_STEPS_UUID, BLERead | BLENotify, 15),
-        jumpsChar_(BLEConfig::CHAR_JUMPS_UUID, BLERead | BLENotify, 15),
-        stairsChar_(BLEConfig::CHAR_STAIRS_UUID, BLERead | BLENotify, 15),
-        stateChar_(BLEConfig::CHAR_STATE_UUID, BLERead | BLENotify, 15),
-        batteryService_(BLEConfig::BATTERY_SERVICE_UUID),
-        batteryLevelChar_(BLEConfig::BATTERY_LEVEL_CHAR_UUID, BLERead | BLENotify),
-        stepsNameDescriptor_("2901", "Step Count"),
-        jumpsNameDescriptor_("2901", "Jump Count"),
-        stairsNameDescriptor_("2901", "Stair Count"),
-        stateNameDescriptor_("2901", "Motion State") {}
-
     BLEService stepMasterService_;
     BLEStringCharacteristic stepsChar_;
     BLEStringCharacteristic jumpsChar_;
@@ -1005,38 +1048,33 @@ private:
 #include <cstddef>
 #include <cstdint>
 
-/// Raw sensor sample structure streamed from the IMU.
-struct RawSample
-{
+struct RawSample {
     uint32_t sequence;
     uint32_t timestampMs;
-    float ax;
-    float ay;
-    float az;
-    float gx;
-    float gy;
-    float gz;
+    float ax, ay, az;
+    float gx, gy, gz;
 };
 
 template <std::size_t Capacity>
-class SampleRingBuffer
-{
+class SampleRingBuffer {
 public:
-    /// Reset the ring buffer to an empty state.
-    void clear()
-    {
+    void clear() {
         head_ = 0;
         tail_ = 0;
         count_ = 0;
+        overflowCount_ = 0;
     }
 
-    /// Add a raw sample to the buffer if there is room.
-    /// Returns false when the buffer is full.
-    bool push(const RawSample& sample)
-    {
-        if (count_ >= Capacity)
-        {
-            return false;
+    // dropOldest parameter provides a clear back-pressure policy
+    bool push(const RawSample& sample, bool dropOldest = false) {
+        if (count_ >= Capacity) {
+            overflowCount_++;
+            if (!dropOldest) {
+                return false; 
+            }
+            // Drop oldest policy
+            tail_ = (tail_ + 1) % Capacity;
+            count_--;
         }
 
         buffer_[head_] = sample;
@@ -1045,47 +1083,53 @@ public:
         return true;
     }
 
-    /// Remove the oldest raw sample from the buffer.
-    /// Returns false when the buffer is empty.
-    bool pop(RawSample& sample)
-    {
-        if (count_ == 0)
-        {
-            return false;
-        }
-
+    bool pop(RawSample& sample) {
+        if (count_ == 0) return false;
         sample = buffer_[tail_];
         tail_ = (tail_ + 1) % Capacity;
         --count_;
         return true;
     }
 
-    /// True when there are no stored samples.
-    bool empty() const
-    {
-        return count_ == 0;
-    }
-
-    /// Number of samples currently stored.
-    std::size_t size() const
-    {
-        return count_;
-    }
-
-    /// Maximum number of samples the buffer can hold.
-    std::size_t capacity() const
-    {
-        return Capacity;
-    }
+    bool empty() const { return count_ == 0; }
+    std::size_t size() const { return count_; }
+    std::size_t capacity() const { return Capacity; }
+    uint32_t getOverflowCount() const { return overflowCount_; }
 
 private:
     RawSample buffer_[Capacity]{};
     std::size_t head_ = 0;
     std::size_t tail_ = 0;
     std::size_t count_ = 0;
+    uint32_t overflowCount_ = 0;
 };
 
-#endif
+#endif // RING_BUFFER_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\config\AlgoConfig.hpp =====
+
+// ========================================================================================================
+// File: AlgoConfig.hpp
+// Purpose: Runtime parameter structure allowing dynamic field calibration without recompiling.
+// ========================================================================================================
+
+#ifndef ALGO_CONFIG_HPP
+#define ALGO_CONFIG_HPP
+
+#include <cstdint>
+
+struct AlgoConfig {
+    float stepThresholdMinG = 1.15f;
+    float stepThresholdMaxG = 1.90f;
+    float stepKFactor = 1.5f;
+    
+    float pitchThresholdStairs = 25.0f;
+    float pitchThresholdJump = 65.0f;
+    
+    uint32_t stepRefractoryMs = 250;
+};
+
+#endif // ALGO_CONFIG_HPP
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\config\BLEConfig.hpp =====
 
@@ -1155,22 +1199,26 @@ constexpr uint8_t LED_OFF = HIGH;
 #include <cstdint>
 #include "params/MotionState.h"
 #include "sensors/MotionFeatures.h"
-#include "utils/SlidingWindow.hpp"
+#include "utils/TimeGuard.hpp"
+#include "config/AlgoConfig.hpp"
 
 class BaseMotion {
 public:
     BaseMotion(MotionState type) : type_(type), count_(0) {}
     virtual ~BaseMotion() = default;
 
-    MotionState evaluate(const MotionFeatures& features, const SlidingWindow& window) {
-        if (!preConditionMet(features, window)) {
+    MotionState evaluate(const MotionFeatures& features, const AlgoConfig& config) {
+        // Shared debounce handling eliminates duplicated logic across all child detectors.
+        if (!timeGuard_.isReady(features.timestampMs)) {
             return MotionState::IDLE;
         }
 
-        if (detectSpecificMotion(features, window)) {
+        if (detectSpecificMotion(features, config)) {
+            timeGuard_.setCooldown(features.timestampMs, config.stepRefractoryMs);
             count_++;
             return type_;
         }
+        
         return MotionState::IDLE;
     }
 
@@ -1179,10 +1227,11 @@ public:
     void resetCount() { count_ = 0; }
 
 protected:
-    virtual bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) = 0;
-    virtual bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) = 0;
+    // preConditionMet() is removed entirely. Detectors only implement physical logic.
+    virtual bool detectSpecificMotion(const MotionFeatures& features, const AlgoConfig& config) = 0;
 
 private:
+    TimeGuard timeGuard_;
     MotionState type_;
     uint32_t count_;
 };
@@ -1191,97 +1240,84 @@ private:
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\detectors\JumpMotion.hpp =====
 
+// ========================================================================================================
+// File: JumpMotion.hpp
+// Purpose: Concrete implementation of BaseMotion specifically for detecting airborne jump events.
+// Features: Uses dynamic thresholds and extreme pitch limits evaluated through the extracted feature struct.
+// ========================================================================================================
+
 #ifndef JUMP_MOTION_HPP
 #define JUMP_MOTION_HPP
 
 #include "detectors/BaseMotion.hpp"
-#include "params/AlgoParams.hpp"
-#include "utils/PeakDetector.hpp"
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 
 class JumpMotion : public BaseMotion {
 public:
-    JumpMotion() : BaseMotion(MotionState::JUMP), stepRefractoryEndMs_(0) {}
+    JumpMotion() : BaseMotion(MotionState::JUMP) {}
 
 protected:
-    bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
-        return true;
-    }
+    bool detectSpecificMotion(const MotionFeatures& features, const AlgoConfig& config) override {
+        // A valid peak must exist in the current frame to evaluate motion
+        if (!features.isPeak) return false;
 
-    bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
-        float peakValue = 0.0f;
-        bool isPeak = peakDetector_.update(features.smoothMag, peakValue);
+        // Calculate the dynamic threshold based on the centralized window statistics
+        float dynamicThreshold = features.windowMean + (config.stepKFactor * features.windowStdDev);
+        float clampedThreshold = std::max(config.stepThresholdMinG, std::min(dynamicThreshold, config.stepThresholdMaxG));
+        
+        float absPitch = std::fabs(features.pitchAngle);
 
-        if (isPeak) {
-            if (features.timestampMs < stepRefractoryEndMs_) return false;
-
-            float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
-            float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
-
-            // Absolute maximum rotation targets (Knees to chest, ballet high kicks, extreme impact leaps).
-            float absPitch = std::fabs(features.pitchAngle);
-            if (peakValue > clampedThreshold && absPitch >= AlgoParams::PITCH_THRESHOLD_JUMP) {
-                stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
-                return true;
-            }
+        // Jumps (e.g., knees-to-chest, high kicks) require extreme rotational pitch
+        if (features.peakValue > clampedThreshold && absPitch >= config.pitchThresholdJump) {
+            return true;
         }
+        
         return false;
     }
-
-private:
-    uint32_t stepRefractoryEndMs_;
-    PeakDetector peakDetector_;
 };
 
 #endif // JUMP_MOTION_HPP
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\detectors\StairMotion.hpp =====
 
+// ========================================================================================================
+// File: StairMotion.hpp
+// Purpose: Concrete implementation of BaseMotion for detecting vertical stair climbing and descending.
+// Features: Isolates stairs by bounding the pitch angle between flat walking and extreme jumping.
+// ========================================================================================================
+
 #ifndef STAIR_MOTION_HPP
 #define STAIR_MOTION_HPP
 
 #include "detectors/BaseMotion.hpp"
-#include "params/AlgoParams.hpp"
-#include "utils/PeakDetector.hpp"
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 
 class StairMotion : public BaseMotion {
 public:
-    StairMotion() : BaseMotion(MotionState::STAIRS), stepRefractoryEndMs_(0) {}
+    StairMotion() : BaseMotion(MotionState::STAIRS) {}
 
 protected:
-    bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
-        return true;
-    }
+    bool detectSpecificMotion(const MotionFeatures& features, const AlgoConfig& config) override {
+        // A valid peak must exist in the current frame to evaluate motion
+        if (!features.isPeak) return false;
 
-    bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
-        float peakValue = 0.0f;
-        bool isPeak = peakDetector_.update(features.smoothMag, peakValue);
+        // Calculate the dynamic threshold based on the centralized window statistics
+        float dynamicThreshold = features.windowMean + (config.stepKFactor * features.windowStdDev);
+        float clampedThreshold = std::max(config.stepThresholdMinG, std::min(dynamicThreshold, config.stepThresholdMaxG));
+        
+        float absPitch = std::fabs(features.pitchAngle);
 
-        if (isPeak) {
-            if (features.timestampMs < stepRefractoryEndMs_) return false;
-
-            float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
-            float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
-
-            // Stairs represent a distinct lifting of the leg without hitting full knee-to-chest height.
-            float absPitch = std::fabs(features.pitchAngle);
-            if (peakValue > clampedThreshold && 
-                absPitch >= AlgoParams::PITCH_THRESHOLD_STAIRS && 
-                absPitch < AlgoParams::PITCH_THRESHOLD_JUMP) {
-                
-                stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
-                return true;
-            }
+        // Stairs require a pitch angle strictly bounded between normal walking and extreme jumping limits
+        if (features.peakValue > clampedThreshold && 
+            absPitch >= config.pitchThresholdStairs && 
+            absPitch < config.pitchThresholdJump) {
+            return true;
         }
+        
         return false;
     }
-
-private:
-    uint32_t stepRefractoryEndMs_;
-    PeakDetector peakDetector_;
 };
 
 #endif // STAIR_MOTION_HPP
@@ -1292,47 +1328,28 @@ private:
 #define STEP_MOTION_HPP
 
 #include "detectors/BaseMotion.hpp"
-#include "params/AlgoParams.hpp"
-#include "utils/PeakDetector.hpp"
 #include <algorithm>
 #include <cmath>
 
 class StepMotion : public BaseMotion {
 public:
-    StepMotion() : BaseMotion(MotionState::STEP), stepRefractoryEndMs_(0) {}
+    StepMotion() : BaseMotion(MotionState::STEP) {}
 
 protected:
-    bool preConditionMet(const MotionFeatures& features, const SlidingWindow& window) override {
-        // Must return true every frame so the PeakDetector history isn't starved.
-        return true;
-    }
+    bool detectSpecificMotion(const MotionFeatures& features, const AlgoConfig& config) override {
+        if (!features.isPeak) return false;
 
-    bool detectSpecificMotion(const MotionFeatures& features, const SlidingWindow& window) override {
-        float peakValue = 0.0f;
-        // Peak detector MUST be fed every single frame to maintain accurate n-1/n-2 history.
-        bool isPeak = peakDetector_.update(features.smoothMag, peakValue);
+        float dynamicThreshold = features.windowMean + (config.stepKFactor * features.windowStdDev);
+        float clampedThreshold = std::max(config.stepThresholdMinG, std::min(dynamicThreshold, config.stepThresholdMaxG));
+        
+        float absPitch = std::fabs(features.pitchAngle);
 
-        if (isPeak) {
-            // 1. Check debounce refractory period
-            if (features.timestampMs < stepRefractoryEndMs_) return false;
-
-            // 2. Calculate adaptive thresholds
-            float dynamicThreshold = window.getMean() + (AlgoParams::STEP_K_FACTOR * window.getStdDev());
-            float clampedThreshold = std::max(AlgoParams::STEP_THRESHOLD_MIN_G, std::min(dynamicThreshold, AlgoParams::STEP_THRESHOLD_MAX_G));
-
-            // 3. Pitch-based isolation (Steps, light hops, running = low pitch)
-            float absPitch = std::fabs(features.pitchAngle);
-            if (peakValue > clampedThreshold && absPitch < AlgoParams::PITCH_THRESHOLD_STAIRS) {
-                stepRefractoryEndMs_ = features.timestampMs + AlgoParams::STEP_REFRACTORY_MS;
-                return true;
-            }
+        if (features.peakValue > clampedThreshold && absPitch < config.pitchThresholdStairs) {
+            return true;
         }
+        
         return false;
     }
-
-private:
-    uint32_t stepRefractoryEndMs_;
-    PeakDetector peakDetector_;
 };
 
 #endif // STEP_MOTION_HPP
@@ -1424,36 +1441,10 @@ public:
 
 #endif // I_FILTER_HPP
 
-===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\hal\SampleTimer.h =====
-
-#ifndef SAMPLE_TIMER_H
-#define SAMPLE_TIMER_H
-
-#include <cstdint>
-#include "params/BuildFlags.h"
-
-extern volatile bool g_sampleDue;
-extern volatile uint32_t g_expectedTicks;
-extern volatile uint32_t g_sampleDrops;
-
-class SampleTimer {
-public:
-    bool begin(uint32_t intervalUs);
-    void end();
-    
-    // Safely clears the ISR flag and returns true if a sample is due.
-    bool consumeSample();
-
-private:
-    bool started_ = false;
-};
-
-#endif // SAMPLE_TIMER_H
-
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\params\AlgoParams.hpp =====
 
 // ========================================================================================================
-// File: include/params/AlgoParams.hpp
+// File: AlgoParams.hpp
 // Purpose: Defines system-wide configuration constants for hardware, signal processing, and algorithms.
 // ========================================================================================================
 
@@ -1490,6 +1481,11 @@ namespace AlgoParams {
     // Pitch boundaries to strictly enforce mutual exclusion (no double counting).
     constexpr float PITCH_THRESHOLD_STAIRS = 25.0f; // Angles >= 25 but < 65 classify as stairs.
     constexpr float PITCH_THRESHOLD_JUMP = 65.0f;   // Angles >= 65 classify as jumps (knees-to-chest/high kicks).
+
+    // --- DSP Filter Weights ---
+    constexpr float EMA_ALPHA = 0.53f;
+    constexpr float PITCH_GYRO_WEIGHT = 0.96f;
+    constexpr float PITCH_ACCEL_WEIGHT = 0.04f;
 }
 
 #endif // ALGO_PARAMS_HPP
@@ -1541,6 +1537,11 @@ MotionSensor* getSensor();
 
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\sensors\MotionFeatures.h =====
 
+// ========================================================================================================
+// File: MotionFeatures.h
+// Purpose: A centralized data structure holding fully processed kinematic features for the current frame.
+// ========================================================================================================
+
 #ifndef MOTION_FEATURES_H
 #define MOTION_FEATURES_H
 
@@ -1551,6 +1552,14 @@ struct MotionFeatures {
     float smoothMag;
     float pitchAngle;
     uint32_t timestampMs;
+    
+    // Extracted from the shared SlidingWindow
+    float windowMean;
+    float windowStdDev;
+    
+    // Extracted from the shared PeakDetector
+    bool isPeak;
+    float peakValue;
 };
 
 #endif // MOTION_FEATURES_H
@@ -1583,11 +1592,90 @@ public:
 
 #endif // MOTION_SENSOR_H
 
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\service\SystemManager.hpp =====
+
+// ========================================================================================================
+// File: SystemManager.hpp
+// Purpose: Central Application Controller. Acts as the mediator between hardware, algorithms, and BLE.
+// ========================================================================================================
+
+#ifndef SYSTEM_MANAGER_HPP
+#define SYSTEM_MANAGER_HPP
+
+#include <cstdint>
+
+#include "params/AlgoParams.hpp"
+#include "config/HardwareConfig.hpp"
+#include "params/BuildFlags.h"
+#include "config/AlgoConfig.hpp"
+
+#include "utils/SampleTimer.h"
+#include "buffers/RingBuffer.hpp"
+#include "streaming/SerialStreamer.h"
+#include "streaming/DebugCli.h"
+#include "streaming/BLEManager.h" 
+
+#include "algorithm/FeatureExtractor.hpp"
+#include "algorithm/IClassifier.hpp"
+#include "algorithm/RuleBasedFSMClassifier.hpp"
+#include "filter/EmaFilter.hpp"
+#include "detectors/StepMotion.hpp"
+#include "detectors/JumpMotion.hpp"
+#include "detectors/StairMotion.hpp"
+#include "sensors/MotionSensor.h"
+
+class SystemManager {
+public:
+    SystemManager();
+    void begin();
+    void run();
+
+private:
+    void fetchSensorData();
+    void processBuffer();
+    void handleVisualFeedback(MotionState currentState);
+
+    AlgoConfig config_;
+
+    SampleTimer sampleTimer_;
+    SampleRingBuffer<AlgoParams::RING_BUFFER_CAPACITY> ringBuffer_;
+    SerialStreamer streamer_;
+    DebugCli cli_;
+    
+    // BLE Dependency Chain
+    BleConnection bleConn_;
+    GattConfigurator bleGatt_;
+    DataBroadcaster bleBroadcaster_;
+    BLEManager bleFacade_; 
+
+    // Algorithm Pipeline
+    EmaFilter mainFilter_;
+    FeatureExtractor featureExtractor_;
+    
+    // Interface Abstraction Implementation
+    RuleBasedFSMClassifier fsmEngine_;
+    IClassifier* classifier_;
+    
+    StepMotion stepDetector_;
+    JumpMotion jumpDetector_;
+    StairMotion stairDetector_;
+
+    MotionSensor* sensor_;
+
+    // Internal State Tracking
+    uint32_t totalSamplesProcessed_;
+    uint32_t ledTurnOffTimestampMs_;
+    bool isLedActive_;
+    uint32_t globalSequence_;
+};
+
+#endif // SYSTEM_MANAGER_HPP
+
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\streaming\BLEManager.h =====
 
 // ========================================================================================================
 // File: BLEManager.h
-// Purpose: Facade class providing a simplified interface to the BLE subsystems (Connection, GATT, Broadcast).
+// Purpose: Facade class providing a simplified interface to the injected BLE subsystems.
 // ========================================================================================================
 
 #ifndef BLE_MANAGER_H
@@ -1595,26 +1683,22 @@ public:
 
 #include <cstdint>
 #include "params/MotionState.h"
+#include "broadcast/BleConnection.hpp"
+#include "broadcast/GattConfigurator.hpp"
+#include "broadcast/DataBroadcaster.hpp"
 
 class BLEManager {
 public:
-    // ----------------------------------------------------------------------------------------------------
-    // Method: begin
-    // Purpose: Orchestrates the initialization of the BLE hardware, GATT configuration, and starts advertising.
-    // ----------------------------------------------------------------------------------------------------
+    BLEManager(BleConnection& conn, GattConfigurator& gatt, DataBroadcaster& broadcaster);
+    
     bool begin();
-
-    // ----------------------------------------------------------------------------------------------------
-    // Method: poll
-    // Purpose: Delegates polling execution to the underlying BLE connection manager to handle radio events.
-    // ----------------------------------------------------------------------------------------------------
     void poll();
-
-    // ----------------------------------------------------------------------------------------------------
-    // Method: updateTelemetry
-    // Purpose: Transmits motion state and updated counter values to connected central devices if a link exists.
-    // ----------------------------------------------------------------------------------------------------
     void updateTelemetry(MotionState state, uint32_t steps, uint32_t jumps, uint32_t stairs);
+
+private:
+    BleConnection& conn_;
+    GattConfigurator& gatt_;
+    DataBroadcaster& broadcaster_;
 };
 
 #endif // BLE_MANAGER_H
@@ -1724,6 +1808,32 @@ private:
 
 #endif // PEAK_DETECTOR_HPP
 
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\utils\SampleTimer.h =====
+
+#ifndef SAMPLE_TIMER_H
+#define SAMPLE_TIMER_H
+
+#include <cstdint>
+#include "params/BuildFlags.h"
+
+extern volatile bool g_sampleDue;
+extern volatile uint32_t g_expectedTicks;
+extern volatile uint32_t g_sampleDrops;
+
+class SampleTimer {
+public:
+    bool begin(uint32_t intervalUs);
+    void end();
+    
+    // Safely clears the ISR flag and returns true if a sample is due.
+    bool consumeSample();
+
+private:
+    bool started_ = false;
+};
+
+#endif // SAMPLE_TIMER_H
+
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\utils\SlidingWindow.hpp =====
 
 #ifndef SLIDING_WINDOW_HPP
@@ -1751,11 +1861,43 @@ private:
 
 #endif // SLIDING_WINDOW_HPP
 
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\utils\TimeGuard.hpp =====
+
+// ========================================================================================================
+// File: TimeGuard.hpp
+// Purpose: A reusable debouncer/cooldown utility to manage refractory periods for motion detectors.
+// ========================================================================================================
+
+#ifndef TIME_GUARD_HPP
+#define TIME_GUARD_HPP
+
+#include <cstdint>
+
+class TimeGuard {
+public:
+    TimeGuard() : cooldownEndMs_(0) {}
+
+    // Checks if the cooldown period has completely elapsed.
+    bool isReady(uint32_t currentTimestampMs) const {
+        return currentTimestampMs >= cooldownEndMs_;
+    }
+
+    // Sets a new cooldown target based on the current time and desired duration.
+    void setCooldown(uint32_t currentTimestampMs, uint32_t durationMs) {
+        cooldownEndMs_ = currentTimestampMs + durationMs;
+    }
+
+private:
+    uint32_t cooldownEndMs_;
+};
+
+#endif // TIME_GUARD_HPP
+
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_broadcast\test_ble_services.cpp =====
 
 // ========================================================================================================
 // File: test_ble_services.cpp
-// Purpose: Validates the BLE Manager Facade, Singleton instantiation, and GATT String Characteristic updates.
+// Purpose: Validates the BLE Manager Facade and GATT String Characteristic updates using Dependency Injection.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -1766,7 +1908,11 @@ private:
 #include "broadcast/DataBroadcaster.hpp"
 #include "broadcast/BleConnection.hpp"
 
-BLEManager bleManager;
+// Instantiate the injected dependency chain explicitly (No Singletons)
+BleConnection bleConn;
+GattConfigurator bleGatt;
+DataBroadcaster bleBroadcaster(bleGatt, bleConn);
+BLEManager bleManager(bleConn, bleGatt, bleBroadcaster);
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -1777,11 +1923,11 @@ void test_ble_initialization(void) {
 }
 
 void test_gatt_default_values(void) {
-    // FIX: Using .toInt() to convert the BLEStringCharacteristic value back to integers for assertion
-    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value().toInt();
-    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value().toInt();
-    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value().toInt();
-    String state = GattConfigurator::getInstance().getStateChar().value();
+    // Extract values directly from the local GATT instance
+    uint32_t steps = bleGatt.getStepsChar().value().toInt();
+    uint32_t jumps = bleGatt.getJumpsChar().value().toInt();
+    uint32_t stairs = bleGatt.getStairsChar().value().toInt();
+    String state = bleGatt.getStateChar().value();
 
     TEST_ASSERT_EQUAL_UINT32(0, steps);
     TEST_ASSERT_EQUAL_UINT32(0, jumps);
@@ -1790,14 +1936,14 @@ void test_gatt_default_values(void) {
 }
 
 void test_broadcaster_updates_characteristics(void) {
-    DataBroadcaster::getInstance().updateCounters(150, 5, 12);
-    DataBroadcaster::getInstance().updateState(MotionState::STEP);
+    // Update logic using the local broadcaster instance
+    bleBroadcaster.updateCounters(150, 5, 12);
+    bleBroadcaster.updateState(MotionState::STEP);
 
-    // FIX: Using .toInt() to convert the BLEStringCharacteristic value back to integers for assertion
-    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value().toInt();
-    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value().toInt();
-    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value().toInt();
-    String state = GattConfigurator::getInstance().getStateChar().value();
+    uint32_t steps = bleGatt.getStepsChar().value().toInt();
+    uint32_t jumps = bleGatt.getJumpsChar().value().toInt();
+    uint32_t stairs = bleGatt.getStairsChar().value().toInt();
+    String state = bleGatt.getStateChar().value();
 
     TEST_ASSERT_EQUAL_UINT32(150, steps);
     TEST_ASSERT_EQUAL_UINT32(5, jumps);
@@ -1822,7 +1968,7 @@ void loop() {}
 
 // ========================================================================================================
 // File: test_broadcaster_stress_endurance.cpp
-// Purpose: Extreme stress testing of the telemetry broadcaster to prevent radio stack buffer overflows.
+// Purpose: Extreme stress testing of the telemetry broadcaster using Dependency Injection.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -1833,7 +1979,11 @@ void loop() {}
 #include "broadcast/DataBroadcaster.hpp"
 #include "broadcast/BleConnection.hpp"
 
-BLEManager bleManager;
+// Instantiate the injected dependency chain explicitly (No Singletons)
+BleConnection bleConn;
+GattConfigurator bleGatt;
+DataBroadcaster bleBroadcaster(bleGatt, bleConn);
+BLEManager bleManager(bleConn, bleGatt, bleBroadcaster);
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -1846,13 +1996,13 @@ void test_ble_initialization(void) {
 void test_broadcaster_stress_endurance(void) {
     // Attempt 10,000 rapid characteristic writes, simulating heavy activity
     for (uint32_t i = 1; i <= 10000; i++) {
-        DataBroadcaster::getInstance().updateCounters(i, 0, 0);
+        bleBroadcaster.updateCounters(i, 0, 0);
+        
         // Force the BLE stack to process the queued internal events
         bleManager.poll();
     }
 
-    // FIX: Using .toInt() to convert the BLEStringCharacteristic value back to integers for assertion
-    uint32_t finalSteps = GattConfigurator::getInstance().getStepsChar().value().toInt();
+    uint32_t finalSteps = bleGatt.getStepsChar().value().toInt();
 
     // Verify 100% data integrity post-stress
     TEST_ASSERT_EQUAL_UINT32_MESSAGE(10000, finalSteps, "BLE Broadcaster dropped packets during stress execution.");
@@ -1965,68 +2115,64 @@ void loop() {}
 // ========================================================================================================
 // File: TestHelpers.h
 // Purpose: Provides robust deterministic signal injection to perfectly test the Pitch-Based FSM logic.
+// Note: Adapted for the decoupled IClassifier architecture.
 // ========================================================================================================
 
 #ifndef TEST_HELPERS_H
 #define TEST_HELPERS_H
 
-#include "algorithem/MotionClassifier.h"
+#include "algorithm/RuleBasedFSMClassifier.hpp"
+#include "algorithm/FeatureExtractor.hpp"
+#include "config/AlgoConfig.hpp"
+#include "sensors/MotionSensor.h"
+#include "sensors/MotionFeatures.h"
 
-// ----------------------------------------------------------------------------------------------------
-// Method: stabilizeWindow
-// Purpose: Feeds resting data to initialize the Sliding Window mean and standard deviation.
-// ----------------------------------------------------------------------------------------------------
-inline void stabilizeWindow(MotionClassifier& classifier, uint32_t& clockMs) {
+inline void stabilizeWindow(FeatureExtractor& extractor, uint32_t& clockMs) {
     MotionData idleData = {0};
     idleData.accelZ = 1.0f;
     for (int i = 0; i < 100; i++) {
         idleData.timestampMs = clockMs;
-        classifier.update(idleData);
+        extractor.process(idleData); 
         clockMs += 10;
     }
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Method: injectKinematicPeak
-// Purpose: Mathematically simulates a human leg swing followed by a ground impact (Peak).
-//          It gives the Complementary Filter time to settle on the correct Pitch angle before impact.
-// ----------------------------------------------------------------------------------------------------
-inline void injectKinematicPeak(MotionClassifier& classifier, uint32_t& clockMs, float baseAx, float baseAz, float peakMultiplier = 2.0f) {
+inline void injectKinematicPeak(FeatureExtractor& extractor, RuleBasedFSMClassifier& classifier, const AlgoConfig& config, uint32_t& clockMs, float baseAx, float baseAz, float peakMultiplier = 2.0f) {
     MotionData data = {0};
     
-    // 1. Swing Phase (100 frames = 1 sec): Settle the Complementary Filter (gyro/accel) to target pitch
     data.accelX = baseAx;
     data.accelZ = baseAz;
     for (int i = 0; i < 100; i++) {
         data.timestampMs = clockMs;
-        classifier.update(data);
+        MotionFeatures features = extractor.process(data);
+        classifier.evaluate(features, config);
         clockMs += 10;
     }
 
-    // 2. Impact Phase (2 frames): Generate a high-G spike to trigger the PeakDetector
     data.accelX = baseAx * peakMultiplier;
     data.accelZ = baseAz * peakMultiplier;
     for (int i = 0; i < 2; i++) {
         data.timestampMs = clockMs;
-        classifier.update(data);
+        MotionFeatures features = extractor.process(data);
+        classifier.evaluate(features, config);
         clockMs += 10;
     }
 
-    // 3. Recovery Phase (5 frames): Drop back down to confirm the falling edge of the peak
     data.accelX = baseAx;
     data.accelZ = baseAz;
     for (int i = 0; i < 5; i++) {
         data.timestampMs = clockMs;
-        classifier.update(data);
+        MotionFeatures features = extractor.process(data);
+        classifier.evaluate(features, config);
         clockMs += 10;
     }
 
-    // 4. Debounce Cooldown (30 frames): Wait out the 250ms refractory period for the next test
     data.accelX = 0.0f;
     data.accelZ = 1.0f;
     for (int i = 0; i < 30; i++) {
         data.timestampMs = clockMs;
-        classifier.update(data);
+        MotionFeatures features = extractor.process(data);
+        classifier.evaluate(features, config);
         clockMs += 10;
     }
 }
@@ -2042,73 +2188,71 @@ inline void injectKinematicPeak(MotionClassifier& classifier, uint32_t& clockMs,
 
 #include <Arduino.h>
 #include <unity.h>
-#include "algorithem/MotionClassifier.h"
+#include "config/AlgoConfig.hpp"
+#include "algorithm/RuleBasedFSMClassifier.hpp"
+#include "algorithm/FeatureExtractor.hpp"
 #include "filter/EmaFilter.hpp"
 #include "detectors/JumpMotion.hpp"
 #include "detectors/StepMotion.hpp"
 #include "TestHelpers.h"
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Standard Knees-to-Chest Jump (Pitch ~ 71.5 degrees)
-// ----------------------------------------------------------------------------------------------------
 void test_knees_to_chest_jump() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     JumpMotion jumpDetector;
+    
     classifier.addDetector(&jumpDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // ax=1.5, az=0.5 generates ~71.5 degrees of pitch. Safely above the 65.0 boundary.
-    injectKinematicPeak(classifier, clockMs, 1.5f, 0.5f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.5f, 0.5f);
 
     TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Ballet / Soccer High Kick (Pitch ~ 84 degrees)
-// ----------------------------------------------------------------------------------------------------
 void test_high_kick_triggers_jump() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     JumpMotion jumpDetector;
     StepMotion stepDetector;
+    
     classifier.addDetector(&jumpDetector);
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // ax=2.0, az=0.2 generates ~84 degrees of extreme pitch rotation.
-    injectKinematicPeak(classifier, clockMs, 2.0f, 0.2f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 2.0f, 0.2f);
 
     TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
     TEST_ASSERT_EQUAL(0, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Hard Flat Landing Rejected as Jump (Pitch 0)
-// ----------------------------------------------------------------------------------------------------
 void test_flat_hard_landing_is_not_jump() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     JumpMotion jumpDetector;
     StepMotion stepDetector;
+    
     classifier.addDetector(&jumpDetector);
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // Massive impact (multiplier 4.0 = ~4.0g) but leg is entirely flat (pitch 0).
-    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f, 4.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f, 4.0f);
 
     TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
     TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -2127,57 +2271,56 @@ void loop() {}
 
 // ========================================================================================================
 // File: test_stair.cpp
-// Purpose: Validates mid-pitch kinematics (25 <= Pitch < 65) routing strictly to the Stair detector.
+// Purpose: Validates mid-pitch kinematics routing strictly to the Stair detector.
 // ========================================================================================================
 
 #include <Arduino.h>
 #include <unity.h>
-#include "algorithem/MotionClassifier.h"
+#include "config/AlgoConfig.hpp"
+#include "algorithm/RuleBasedFSMClassifier.hpp"
+#include "algorithm/FeatureExtractor.hpp"
 #include "filter/EmaFilter.hpp"
 #include "detectors/StairMotion.hpp"
 #include "detectors/StepMotion.hpp"
 #include "TestHelpers.h"
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Valid Stair Climb (Pitch ~ 45 degrees)
-// ----------------------------------------------------------------------------------------------------
 void test_valid_stair_climb() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StairMotion stairDetector;
+    
     classifier.addDetector(&stairDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // ax=1.0, az=1.0 generates exactly 45 degrees of pitch. Fits perfectly in the 25-65 bounds.
-    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.0f, 1.0f);
 
     TEST_ASSERT_EQUAL(1, stairDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: High Energy Flat Walk Rejected as Stairs
-// ----------------------------------------------------------------------------------------------------
 void test_high_energy_flat_walk_rejected_as_stairs() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StairMotion stairDetector;
     StepMotion stepDetector;
+    
     classifier.addDetector(&stairDetector);
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // Extreme impact (multiplier 3.5 = ~3.5g) but 0 degrees pitch. Should route to STEP.
-    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f, 3.5f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f, 3.5f);
 
     TEST_ASSERT_EQUAL(0, stairDetector.getCount());
     TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -2195,41 +2338,41 @@ void loop() {}
 
 // ========================================================================================================
 // File: test_step.cpp
-// Purpose: Validates step detection logic (walking/running) using low-pitch kinematics (< 25 degrees).
+// Purpose: Validates step detection logic (walking/running) using low-pitch kinematics.
 // ========================================================================================================
 
 #include <Arduino.h>
 #include <unity.h>
-#include "algorithem/MotionClassifier.h"
+#include "config/AlgoConfig.hpp"
+#include "algorithm/RuleBasedFSMClassifier.hpp"
+#include "algorithm/FeatureExtractor.hpp"
 #include "filter/EmaFilter.hpp"
 #include "detectors/StepMotion.hpp"
 #include "detectors/JumpMotion.hpp"
 #include "TestHelpers.h"
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Normal Walking Step (Pitch ~ 0 degrees)
-// ----------------------------------------------------------------------------------------------------
 void test_normal_walking_step() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StepMotion stepDetector;
+    
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // ax=0.0, az=1.0 generates exactly 0 degrees of pitch. 
-    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f);
 
     TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Running (Pitch ~ 15 degrees)
-// ----------------------------------------------------------------------------------------------------
 void test_running_is_counted_as_steps() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StepMotion stepDetector;
     JumpMotion jumpDetector;
     
@@ -2237,44 +2380,45 @@ void test_running_is_counted_as_steps() {
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs); 
+    stabilizeWindow(extractor, clockMs); 
 
-    // 4 fast running steps: ax=0.3, az=1.0 yields ~16.7 degrees (Well below the 25 degree threshold)
     for (int step = 0; step < 4; step++) {
-        injectKinematicPeak(classifier, clockMs, 0.3f, 1.0f, 2.5f);
+        injectKinematicPeak(extractor, classifier, config, clockMs, 0.3f, 1.0f, 2.5f);
     }
 
     TEST_ASSERT_EQUAL(4, stepDetector.getCount());
     TEST_ASSERT_EQUAL(0, jumpDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Debounce Time Lock Rejection
-// ----------------------------------------------------------------------------------------------------
 void test_debounce_time_lock_rejection() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StepMotion stepDetector;
+    
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
     MotionData data = {0};
     
-    // First valid peak
-    data.accelZ = 2.0f; data.timestampMs = clockMs; classifier.update(data);
-    data.accelZ = 1.0f; data.timestampMs = clockMs + 10; classifier.update(data);
+    data.accelZ = 2.0f; data.timestampMs = clockMs; 
+    classifier.evaluate(extractor.process(data), config);
     
-    // Second peak falling perfectly inside the 250ms refractory window (at +100ms)
-    data.accelZ = 2.0f; data.timestampMs = clockMs + 100; classifier.update(data);
-    data.accelZ = 1.0f; data.timestampMs = clockMs + 110; classifier.update(data);
+    data.accelZ = 1.0f; data.timestampMs = clockMs + 10; 
+    classifier.evaluate(extractor.process(data), config);
+    
+    data.accelZ = 2.0f; data.timestampMs = clockMs + 100; 
+    classifier.evaluate(extractor.process(data), config);
+    
+    data.accelZ = 1.0f; data.timestampMs = clockMs + 110; 
+    classifier.evaluate(extractor.process(data), config);
 
-    // Only one should register!
     TEST_ASSERT_EQUAL(1, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
 
@@ -2298,38 +2442,39 @@ void loop() {}
 
 #include <Arduino.h>
 #include <unity.h>
-#include "algorithem/MotionClassifier.h"
+#include "config/AlgoConfig.hpp"
+#include "algorithm/RuleBasedFSMClassifier.hpp"
+#include "algorithm/FeatureExtractor.hpp"
 #include "filter/EmaFilter.hpp"
 #include "detectors/StepMotion.hpp"
 #include "detectors/JumpMotion.hpp"
 #include "detectors/StairMotion.hpp"
 #include "TestHelpers.h"
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Marathon Stress (1000 Steps)
-// ----------------------------------------------------------------------------------------------------
 void test_marathon_stress_1000_steps() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StepMotion stepDetector;
+    
     classifier.addDetector(&stepDetector);
     
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
     for (int i = 0; i < 1000; i++) {
-        injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
+        injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f);
     }
 
     TEST_ASSERT_EQUAL(1000, stepDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
-// Test: Complex Triathlon (Walk -> Stairs -> Jump)
-// ----------------------------------------------------------------------------------------------------
 void test_complex_triathlon_transitions() {
+    AlgoConfig config;
     EmaFilter filter(0.53f);
-    MotionClassifier classifier(&filter);
+    FeatureExtractor extractor(&filter);
+    RuleBasedFSMClassifier classifier;
     StepMotion stepDetector;
     JumpMotion jumpDetector;
     StairMotion stairDetector;
@@ -2339,26 +2484,22 @@ void test_complex_triathlon_transitions() {
     classifier.addDetector(&stepDetector);
 
     uint32_t clockMs = 0;
-    stabilizeWindow(classifier, clockMs);
+    stabilizeWindow(extractor, clockMs);
 
-    // 2 Steps (Pitch 0)
-    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
-    injectKinematicPeak(classifier, clockMs, 0.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 0.0f, 1.0f);
     
-    // 3 Stairs (Pitch 45)
-    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
-    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
-    injectKinematicPeak(classifier, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.0f, 1.0f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 1.0f, 1.0f);
 
-    // 1 Jump (Pitch 76)
-    injectKinematicPeak(classifier, clockMs, 2.0f, 0.5f);
+    injectKinematicPeak(extractor, classifier, config, clockMs, 2.0f, 0.5f);
 
     TEST_ASSERT_EQUAL(2, stepDetector.getCount());
     TEST_ASSERT_EQUAL(3, stairDetector.getCount());
     TEST_ASSERT_EQUAL(1, jumpDetector.getCount());
 }
 
-// ----------------------------------------------------------------------------------------------------
 void setUp(void) {}
 void tearDown(void) {}
 

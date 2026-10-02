@@ -1,6 +1,6 @@
 // ========================================================================================================
 // File: test_ble_services.cpp
-// Purpose: Validates the BLE Manager Facade, Singleton instantiation, and GATT String Characteristic updates.
+// Purpose: Validates the BLE Manager Facade and GATT String Characteristic updates using Dependency Injection.
 // ========================================================================================================
 
 #include <Arduino.h>
@@ -11,7 +11,11 @@
 #include "broadcast/DataBroadcaster.hpp"
 #include "broadcast/BleConnection.hpp"
 
-BLEManager bleManager;
+// Instantiate the injected dependency chain explicitly (No Singletons)
+BleConnection bleConn;
+GattConfigurator bleGatt;
+DataBroadcaster bleBroadcaster(bleGatt, bleConn);
+BLEManager bleManager(bleConn, bleGatt, bleBroadcaster);
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -22,11 +26,11 @@ void test_ble_initialization(void) {
 }
 
 void test_gatt_default_values(void) {
-    // FIX: Using .toInt() to convert the BLEStringCharacteristic value back to integers for assertion
-    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value().toInt();
-    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value().toInt();
-    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value().toInt();
-    String state = GattConfigurator::getInstance().getStateChar().value();
+    // Extract values directly from the local GATT instance
+    uint32_t steps = bleGatt.getStepsChar().value().toInt();
+    uint32_t jumps = bleGatt.getJumpsChar().value().toInt();
+    uint32_t stairs = bleGatt.getStairsChar().value().toInt();
+    String state = bleGatt.getStateChar().value();
 
     TEST_ASSERT_EQUAL_UINT32(0, steps);
     TEST_ASSERT_EQUAL_UINT32(0, jumps);
@@ -35,14 +39,14 @@ void test_gatt_default_values(void) {
 }
 
 void test_broadcaster_updates_characteristics(void) {
-    DataBroadcaster::getInstance().updateCounters(150, 5, 12);
-    DataBroadcaster::getInstance().updateState(MotionState::STEP);
+    // Update logic using the local broadcaster instance
+    bleBroadcaster.updateCounters(150, 5, 12);
+    bleBroadcaster.updateState(MotionState::STEP);
 
-    // FIX: Using .toInt() to convert the BLEStringCharacteristic value back to integers for assertion
-    uint32_t steps = GattConfigurator::getInstance().getStepsChar().value().toInt();
-    uint32_t jumps = GattConfigurator::getInstance().getJumpsChar().value().toInt();
-    uint32_t stairs = GattConfigurator::getInstance().getStairsChar().value().toInt();
-    String state = GattConfigurator::getInstance().getStateChar().value();
+    uint32_t steps = bleGatt.getStepsChar().value().toInt();
+    uint32_t jumps = bleGatt.getJumpsChar().value().toInt();
+    uint32_t stairs = bleGatt.getStairsChar().value().toInt();
+    String state = bleGatt.getStateChar().value();
 
     TEST_ASSERT_EQUAL_UINT32(150, steps);
     TEST_ASSERT_EQUAL_UINT32(5, jumps);

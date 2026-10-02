@@ -1,35 +1,34 @@
 // ========================================================================================================
 // File: BLEManager.cpp
-// Purpose: Implementation of the BLEManager Facade orchestrating the underlying Singleton components.
+// Purpose: Implementation of the BLEManager Facade orchestrating the injected components.
 // ========================================================================================================
 
 #include "streaming/BLEManager.h"
-#include "broadcast/BleConnection.hpp"
-#include "broadcast/GattConfigurator.hpp"
-#include "broadcast/DataBroadcaster.hpp"
 #include <Arduino.h>
 
+BLEManager::BLEManager(BleConnection& conn, GattConfigurator& gatt, DataBroadcaster& broadcaster)
+    : conn_(conn), gatt_(gatt), broadcaster_(broadcaster) {}
+
 bool BLEManager::begin() {
-    if (!BleConnection::getInstance().begin()) {
+    if (!conn_.begin()) {
         Serial.println("[ERROR] BLE radio initialization failed!");
         return false;
     }
 
-    GattConfigurator::getInstance().setupServices();
-    BleConnection::getInstance().startAdvertising();
+    gatt_.setupServices();
+    conn_.startAdvertising();
 
     Serial.println("[INFO] BLE Facade initialized successfully. Advertising...");
     return true;
 }
 
 void BLEManager::poll() {
-    BleConnection::getInstance().poll();
+    conn_.poll();
 }
 
 void BLEManager::updateTelemetry(MotionState state, uint32_t steps, uint32_t jumps, uint32_t stairs) {
-    if (BleConnection::getInstance().isConnected()) {
-        // DataBroadcaster now internally handles state-tracking, subscription validation, and stack polling
-        DataBroadcaster::getInstance().updateState(state);
-        DataBroadcaster::getInstance().updateCounters(steps, jumps, stairs);
+    if (conn_.isConnected()) {
+        broadcaster_.updateState(state);
+        broadcaster_.updateCounters(steps, jumps, stairs);
     }
 }

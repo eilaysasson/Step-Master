@@ -1,5 +1,5 @@
 // ========================================================================================================
-// File: include/params/AlgoParams.hpp
+// File: AlgoParams.hpp
 // Purpose: Defines system-wide configuration constants for hardware, signal processing, and algorithms.
 // ========================================================================================================
 
@@ -36,6 +36,11 @@ namespace AlgoParams {
     // Pitch boundaries to strictly enforce mutual exclusion (no double counting).
     constexpr float PITCH_THRESHOLD_STAIRS = 25.0f; // Angles >= 25 but < 65 classify as stairs.
     constexpr float PITCH_THRESHOLD_JUMP = 65.0f;   // Angles >= 65 classify as jumps (knees-to-chest/high kicks).
+
+    // --- DSP Filter Weights ---
+    constexpr float EMA_ALPHA = 0.53f;
+    constexpr float PITCH_GYRO_WEIGHT = 0.96f;
+    constexpr float PITCH_ACCEL_WEIGHT = 0.04f;
 }
 
 #endif // ALGO_PARAMS_HPP

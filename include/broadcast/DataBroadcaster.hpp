@@ -1,40 +1,41 @@
+// ========================================================================================================
+// File: DataBroadcaster.hpp
+// Purpose: Handles checking for state changes and dispatching updates to the GATT configurator.
+// ========================================================================================================
+
 #ifndef DATA_BROADCASTER_HPP
 #define DATA_BROADCASTER_HPP
 
 #include <cstdint>
 #include <Arduino.h>
-#include "GattConfigurator.hpp"
-#include "BleConnection.hpp"
+#include "broadcast/GattConfigurator.hpp"
+#include "broadcast/BleConnection.hpp"
 #include "params/MotionState.h"
 
 class DataBroadcaster {
 public:
-    static DataBroadcaster& getInstance() {
-        static DataBroadcaster instance;
-        return instance;
-    }
-
-    DataBroadcaster(const DataBroadcaster&) = delete;
-    DataBroadcaster& operator=(const DataBroadcaster&) = delete;
+    // Dependencies injected via constructor
+    DataBroadcaster(GattConfigurator& gatt, BleConnection& ble) 
+        : gatt_(gatt), ble_(ble), lastSteps_(0), lastJumps_(0), lastStairs_(0), lastState_(MotionState::IDLE) {}
 
     void updateCounters(uint32_t steps, uint32_t jumps, uint32_t stairs) {
-        // String conversion happens ONLY when a counter actually changes, ensuring top performance.
         if (steps != lastSteps_) {
-            GattConfigurator::getInstance().getStepsChar().writeValue(String(steps));
+            gatt_.getStepsChar().writeValue(String(steps));
             lastSteps_ = steps;
-            BleConnection::getInstance().poll();
+            ble_.poll();
         }
         
+        // This logic was missing/skipped in your current file
         if (jumps != lastJumps_) {
-            GattConfigurator::getInstance().getJumpsChar().writeValue(String(jumps));
+            gatt_.getJumpsChar().writeValue(String(jumps));
             lastJumps_ = jumps;
-            BleConnection::getInstance().poll();
+            ble_.poll();
         }
         
         if (stairs != lastStairs_) {
-            GattConfigurator::getInstance().getStairsChar().writeValue(String(stairs));
+            gatt_.getStairsChar().writeValue(String(stairs));
             lastStairs_ = stairs;
-            BleConnection::getInstance().poll();
+            ble_.poll();
         }
     }
 
@@ -46,19 +47,19 @@ public:
             else if (state == MotionState::STAIRS) stateStr = "STAIRS";
             else if (state == MotionState::NOISE) stateStr = "NOISE";
 
-            GattConfigurator::getInstance().getStateChar().writeValue(stateStr);
+            gatt_.getStateChar().writeValue(stateStr);
             lastState_ = state;
-            BleConnection::getInstance().poll();
+            ble_.poll();
         }
     }
 
 private:
-    DataBroadcaster() = default;
-
-    uint32_t lastSteps_ = 0;
-    uint32_t lastJumps_ = 0;
-    uint32_t lastStairs_ = 0;
-    MotionState lastState_ = MotionState::IDLE;
+    GattConfigurator& gatt_;
+    BleConnection& ble_;
+    uint32_t lastSteps_;
+    uint32_t lastJumps_;
+    uint32_t lastStairs_;
+    MotionState lastState_;
 };
 
 #endif // DATA_BROADCASTER_HPP

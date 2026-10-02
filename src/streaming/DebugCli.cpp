@@ -1,7 +1,7 @@
 #include "streaming/DebugCli.h"
 
 #include "params/BuildFlags.h"
-#include "hal/SampleTimer.h"
+#include "utils/SampleTimer.h"
 #include "streaming/SerialStreamer.h"
 
 #include <Arduino.h>
