@@ -1671,6 +1671,331 @@ private:
 
 #endif // SYSTEM_MANAGER_HPP
 
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\storage\DataContracts.hpp =====
+
+// ========================================================================================================
+// File: DataContracts.hpp
+// Purpose: v1.0 M4.0-GATE - Defines the precise memory layout for Flash persistence. 
+// Enforces strict sizing, 32-bit alignment, and power-loss safety.
+// ========================================================================================================
+
+#ifndef DATA_CONTRACTS_HPP
+#define DATA_CONTRACTS_HPP
+
+#include <cstdint>
+
+namespace StepMaster::Storage {
+
+    // Magic numbers for validation and atomic commits
+    constexpr uint32_t PAGE_VALIDATION_SIGNATURE = 0x53544550;     // "STEP"
+    constexpr uint32_t ATOMIC_COMMIT_FLAG = 0xC01117ED; // COMMITTED
+
+    // ----------------------------------------------------------------------------------------------------
+    // Helper: Serial Arithmetic for Sequence Wraparound handling
+    // Returns true if seqA is strictly newer than seqB, safely handling uint32_t overflow.
+    // ----------------------------------------------------------------------------------------------------
+    inline bool isSequenceNewer(uint32_t seqA, uint32_t seqB) {
+        return static_cast<int32_t>(seqA - seqB) > 0;
+    }
+
+    // ----------------------------------------------------------------------------------------------------
+    // 1. LogRecord (20 Bytes)
+    // Purpose: Represents a single historical event (Step, Jump, Stair).
+    // Capacity Model: At 20 bytes/record, a 128KB partition stores ~6,500 records.
+    // Depending on event rate, this provides dynamic capacity (not a hardcoded "2-4 days").
+    // ----------------------------------------------------------------------------------------------------
+    struct alignas(4) LogRecord {
+        uint32_t sequence;      // Monotonically increasing globally
+        uint32_t sessionId;     // Links timestampMs to a specific boot epoch
+        uint32_t timestampMs;   // Monotonic uptime of the event within the session
+        uint8_t  eventType;     // Corresponds to MotionState enum
+        uint8_t  eventData;     // Optional context (e.g., peak acceleration)
+        uint16_t crc16;         // Protects the first 14 bytes (sequence to eventData)
+        uint32_t commitWord;    // 32-bit flash-friendly commit marker (0xC0MM17ED)
+    };
+    static_assert(sizeof(LogRecord) == 20, "LogRecord must be exactly 20 bytes");
+    static_assert(alignof(LogRecord) == 4, "LogRecord must be 32-bit aligned");
+
+    // ----------------------------------------------------------------------------------------------------
+    // 2. PageHeader (20 Bytes)
+    // Purpose: Placed at the exact beginning of every 4KB Flash sector.
+    // ----------------------------------------------------------------------------------------------------
+    struct alignas(4) PageHeader {
+        uint32_t magic;               // Must be PAGE_MAGIC_WORD
+        uint16_t formatVersion;       // Allows future schema migrations (e.g., 0x01)
+        uint16_t headerFlags;         // Status flags or reserved space
+        uint32_t pageSequence;        // uint32_t to safely handle long-term rotation
+        uint32_t firstRecordSequence; // The sequence ID of the first record in this page
+        uint32_t crc32;               // Checksum of the header to verify structural integrity
+    };
+    static_assert(sizeof(PageHeader) == 20, "PageHeader must be exactly 20 bytes");
+    static_assert(alignof(PageHeader) == 4, "PageHeader must be 32-bit aligned");
+
+    // ----------------------------------------------------------------------------------------------------
+    // 3. PersistentState (40 Bytes)
+    // Purpose: A checkpoint saved periodically. Includes an explicit epoch and cumulative counters.
+    // ----------------------------------------------------------------------------------------------------
+    struct alignas(8) PersistentState {
+        uint64_t epochAnchor;                // 8 bytes: True Unix time provided by BLE sync
+        uint32_t totalSteps;                 // 4 bytes
+        uint32_t totalJumps;                 // 4 bytes
+        uint32_t totalStairs;                // 4 bytes
+        uint32_t sessionId;                  // 4 bytes: Incremented on every device reboot
+        uint32_t highestCommittedSequence;   // 4 bytes: Next sequence = highestCommittedSequence + 1
+        uint32_t monotonicAnchor;            // 4 bytes: The device millis() when epochAnchor was set
+        uint32_t reserved;                   // 4 bytes: Padding/Future use
+        uint32_t crc32;                      // 4 bytes: Checksum of the entire state block
+    };
+    static_assert(sizeof(PersistentState) == 40, "PersistentState must be exactly 40 bytes");
+    // Explicit alignas(8) used above because uint64_t forces 8-byte alignment on some ARM ABIs.
+
+} // namespace StepMaster::Storage
+
+#endif // DATA_CONTRACTS_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\storage\StorageInterfaces.hpp =====
+
+// ========================================================================================================
+// File: StorageInterfaces.hpp
+// Purpose: v1.0 M4.0-GATE - Abstract interfaces for offline storage and synchronization.
+// ========================================================================================================
+
+#ifndef STORAGE_INTERFACES_HPP
+#define STORAGE_INTERFACES_HPP
+
+#include "DataContracts.hpp"
+#include <cstddef>
+
+namespace StepMaster::Storage {
+
+    // ----------------------------------------------------------------------------------------------------
+    // Interface: IEventStorage
+    // Purpose: Manages the Wear-Leveled Ring Buffer for LogRecords.
+    // ----------------------------------------------------------------------------------------------------
+    class IEventStorage {
+    public:
+        virtual ~IEventStorage() = default;
+        
+        virtual bool initAndRecover() = 0;
+        virtual bool appendRecord(const LogRecord& record) = 0;
+        
+        // Sync API: Fetch range to coordinate with the mobile app
+        virtual bool getRange(uint32_t& oldestSequence, uint32_t& newestSequence) const = 0;
+        
+        // Sync API: Efficient batch reading for high-throughput BLE transmission
+        virtual bool readBatch(uint32_t startSequence, LogRecord* outRecords, size_t capacity, size_t& count) = 0;
+        
+        // Destructive operations return status to handle hardware failures
+        virtual bool format() = 0;
+        virtual bool eraseAll() = 0;
+    };
+
+    // ----------------------------------------------------------------------------------------------------
+    // Interface: IStateStorage
+    // Purpose: Manages the periodic checkpoints of the overall counters.
+    // ----------------------------------------------------------------------------------------------------
+    class IStateStorage {
+    public:
+        virtual ~IStateStorage() = default;
+        
+        virtual bool loadState(PersistentState& outState) = 0;
+        virtual bool saveState(const PersistentState& state) = 0;
+    };
+
+    // ----------------------------------------------------------------------------------------------------
+    // Interface: ITimeService
+    // Purpose: Separates monotonic intervals from human-readable wall clock time.
+    // ----------------------------------------------------------------------------------------------------
+    class ITimeService {
+    public:
+        virtual ~ITimeService() = default;
+        
+        virtual uint32_t getMonotonicMillis() = 0;
+        virtual uint64_t getUnixEpoch() = 0;
+        virtual void syncEpoch(uint64_t newEpochTime) = 0;
+        virtual uint32_t getCurrentSessionId() const = 0;
+    };
+
+    // ----------------------------------------------------------------------------------------------------
+    // Interface: ISyncManager
+    // Purpose: Handles the Resumable Bulk Sync protocol over BLE using Cumulative ACKs.
+    // ----------------------------------------------------------------------------------------------------
+    class ISyncManager {
+    public:
+        virtual ~ISyncManager() = default;
+        
+        virtual void beginSync(uint32_t fromSequence) = 0;
+        
+        // Cumulative ACK: Confirms that all records <= sequenceId were durably accepted by the app
+        virtual void acknowledge(uint32_t sequenceId) = 0;
+        virtual bool isSyncInProgress() const = 0;
+    };
+
+} // namespace StepMaster::Storage
+
+#endif // STORAGE_INTERFACES_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\storage\SyncManager.hpp =====
+
+// ========================================================================================================
+// File: SyncManager.hpp
+// Purpose: Implements ISyncManager to handle resumable offline data synchronization via Cumulative ACKs.
+// ========================================================================================================
+
+#ifndef SYNC_MANAGER_HPP
+#define SYNC_MANAGER_HPP
+
+#include "storage/StorageInterfaces.hpp"
+#include <cstddef>
+
+namespace StepMaster {
+namespace Storage {
+
+    // Abstraction for the underlying BLE transmission layer
+    class IBulkTransport {
+    public:
+        virtual ~IBulkTransport() = default;
+        // Transmits a batch of records. Returns true if queued successfully.
+        virtual bool sendBatch(const LogRecord* records, size_t count) = 0;
+    };
+
+    class SyncManager : public ISyncManager {
+    public:
+        SyncManager(IEventStorage& storage, IBulkTransport& transport) 
+            : storage_(storage), transport_(transport), 
+              syncInProgress_(false), currentSequence_(0), lastAckedSequence_(0) {}
+
+        void beginSync(uint32_t fromSequence) override {
+            currentSequence_ = fromSequence;
+            lastAckedSequence_ = fromSequence > 0 ? fromSequence - 1 : 0;
+            syncInProgress_ = true;
+        }
+
+        void acknowledge(uint32_t sequenceId) override {
+            if (isSequenceNewer(sequenceId, lastAckedSequence_)) {
+                lastAckedSequence_ = sequenceId;
+            }
+            
+            // Check if we reached the absolute newest available record in storage
+            uint32_t oldest, newest;
+            if (storage_.getRange(oldest, newest)) {
+                if (!isSequenceNewer(newest, lastAckedSequence_)) {
+                    syncInProgress_ = false; // Sync fully completed
+                }
+            } else {
+                syncInProgress_ = false; // Storage is completely empty
+            }
+        }
+
+        bool isSyncInProgress() const override {
+            return syncInProgress_;
+        }
+
+        // Must be called periodically from the main loop to process pending data
+        void poll() {
+            if (!syncInProgress_) return;
+
+            LogRecord batch[5];
+            size_t count = 0;
+
+            // Read the next sequential batch from storage
+            if (storage_.readBatch(currentSequence_, batch, 5, count)) {
+                if (transport_.sendBatch(batch, count)) {
+                    // Advance pointer to the sequence following the last sent record
+                    currentSequence_ = batch[count - 1].sequence + 1;
+                }
+            }
+        }
+
+    private:
+        IEventStorage& storage_;
+        IBulkTransport& transport_;
+        bool syncInProgress_;
+        uint32_t currentSequence_;
+        uint32_t lastAckedSequence_;
+    };
+
+} // namespace Storage
+} // namespace StepMaster
+
+#endif // SYNC_MANAGER_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\storage\TimeManager.hpp =====
+
+// ========================================================================================================
+// File: TimeManager.hpp
+// Purpose: Implements ITimeService. Manages Session IDs across reboots and bridges monotonic uptime 
+// to real-world Unix Epoch time using a dynamic anchor point.
+// ========================================================================================================
+
+#ifndef TIME_MANAGER_HPP
+#define TIME_MANAGER_HPP
+
+#include "storage/StorageInterfaces.hpp"
+#include <Arduino.h>
+
+namespace StepMaster {
+namespace Storage {
+
+    class TimeManager : public ITimeService {
+    public:
+        // Dependency Injection: Needs the StateStorage to persist the anchor and session
+        TimeManager(IStateStorage& stateStorage) : stateStorage_(stateStorage) {}
+
+        bool begin() {
+            // Load existing state from Flash/Mock
+            if (!stateStorage_.loadState(state_)) {
+                // If storage is unformatted or corrupt, initialize a fresh state
+                state_ = PersistentState{0};
+            }
+            
+            // Increment Session ID to logically separate events before/after power cycles
+            state_.sessionId++;
+            
+            // Save immediately so the new session is committed
+            return stateStorage_.saveState(state_);
+        }
+
+        uint32_t getMonotonicMillis() override {
+            return millis();
+        }
+
+        uint64_t getUnixEpoch() override {
+            if (state_.epochAnchor == 0) {
+                return 0; // Device has not been synced with the phone yet
+            }
+            
+            uint32_t currentMillis = getMonotonicMillis();
+            uint32_t elapsedMs = currentMillis - state_.monotonicAnchor;
+            
+            return state_.epochAnchor + elapsedMs;
+        }
+
+        void syncEpoch(uint64_t newEpochTimeMs) override {
+            state_.epochAnchor = newEpochTimeMs;
+            state_.monotonicAnchor = getMonotonicMillis();
+            stateStorage_.saveState(state_);
+        }
+
+        uint32_t getCurrentSessionId() const override {
+            return state_.sessionId;
+        }
+
+        // Direct access to state for other components (e.g., updating total steps)
+        PersistentState& getState() { return state_; }
+        
+        bool saveState() { return stateStorage_.saveState(state_); }
+
+    private:
+        IStateStorage& stateStorage_;
+        PersistentState state_{};
+    };
+
+} // namespace Storage
+} // namespace StepMaster
+
+#endif // TIME_MANAGER_HPP
+
 ===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\include\streaming\BLEManager.h =====
 
 // ========================================================================================================
@@ -2512,3 +2837,546 @@ void setup() {
 }
 
 void loop() {}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_offline_storage\MockEventStorage.hpp =====
+
+// ========================================================================================================
+// File: MockEventStorage.hpp
+// Purpose: In-memory simulation of Flash storage for testing Wear-Leveling, CRC, and Recovery logic.
+// ========================================================================================================
+
+#ifndef MOCK_EVENT_STORAGE_HPP
+#define MOCK_EVENT_STORAGE_HPP
+
+#include "storage/StorageInterfaces.hpp"
+#include <cstring>
+#include <vector>
+
+namespace StepMaster::Storage::Test {
+
+    class MockEventStorage : public IEventStorage {
+    public:
+        static constexpr uint32_t PAGE_SIZE = 4096;
+        static constexpr uint32_t NUM_PAGES = 32;
+        static constexpr uint32_t RECORDS_PER_PAGE = (PAGE_SIZE - sizeof(PageHeader)) / sizeof(LogRecord);
+
+        struct MockPage {
+            PageHeader header;
+            LogRecord records[RECORDS_PER_PAGE];
+        };
+
+        MockPage memory[NUM_PAGES];
+        uint32_t activePageIdx = 0;
+        uint32_t activeRecordIdx = 0;
+        bool simulatePowerLoss = false;
+        bool simulateCrcCorruption = false;
+
+        MockEventStorage() { eraseAll(); }
+
+        bool format() override {
+            return eraseAll();
+        }
+
+        bool eraseAll() override {
+            memset(memory, 0xFF, sizeof(memory)); // Flash default erased state is 0xFF
+            activePageIdx = 0;
+            activeRecordIdx = 0;
+            
+            // Format first page
+            memory[0].header.magic = PAGE_VALIDATION_SIGNATURE;
+            memory[0].header.formatVersion = 1;
+            memory[0].header.pageSequence = 1;
+            memory[0].header.firstRecordSequence = 1;
+            memory[0].header.crc32 = calculateHeaderCrc(memory[0].header);
+            return true;
+        }
+
+        bool initAndRecover() override {
+            uint32_t highestPageSeq = 0;
+            int bestPageIdx = -1;
+
+            // 1. Find the active page (highest valid pageSequence)
+            for (uint32_t i = 0; i < NUM_PAGES; i++) {
+                if (memory[i].header.magic == PAGE_VALIDATION_SIGNATURE) {
+                    if (memory[i].header.crc32 == calculateHeaderCrc(memory[i].header)) {
+                        if (bestPageIdx == -1 || isSequenceNewer(memory[i].header.pageSequence, highestPageSeq)) {
+                            highestPageSeq = memory[i].header.pageSequence;
+                            bestPageIdx = i;
+                        }
+                    }
+                }
+            }
+
+            if (bestPageIdx == -1) {
+                return format(); // No valid pages found, factory reset
+            }
+
+            activePageIdx = bestPageIdx;
+
+            // 2. Scan records in the active page to find the next write pointer
+            activeRecordIdx = 0;
+            for (uint32_t i = 0; i < RECORDS_PER_PAGE; i++) {
+                const LogRecord& rec = memory[activePageIdx].records[i];
+                if (rec.commitWord == 0xFFFFFFFF) break; // Reached erased memory
+                
+                if (rec.commitWord == ATOMIC_COMMIT_FLAG) {
+                    if (rec.crc16 == calculateRecordCrc(rec)) {
+                        activeRecordIdx = i + 1; // Valid record, move pointer forward
+                    } else {
+                        break; // Corrupted CRC! Stop recovery here.
+                    }
+                } else {
+                    break; // Power loss detected (incomplete commit). Stop recovery here.
+                }
+            }
+
+            // If page is full, rotate to next page
+            if (activeRecordIdx >= RECORDS_PER_PAGE) {
+                rotatePage();
+            }
+
+            return true;
+        }
+
+        bool appendRecord(const LogRecord& record) override {
+            if (activeRecordIdx >= RECORDS_PER_PAGE) {
+                rotatePage();
+            }
+
+            LogRecord copy = record;
+            copy.crc16 = calculateRecordCrc(copy);
+            
+            if (simulateCrcCorruption) {
+                copy.crc16 ^= 0xFFFF; // Break CRC
+                simulateCrcCorruption = false;
+            }
+
+            if (simulatePowerLoss) {
+                copy.commitWord = 0xFFFFFFFF; // Simulate power dying before commit word is written
+                simulatePowerLoss = false;
+            } else {
+                copy.commitWord = ATOMIC_COMMIT_FLAG;
+            }
+
+            memory[activePageIdx].records[activeRecordIdx] = copy;
+            activeRecordIdx++;
+            return true;
+        }
+
+        bool getRange(uint32_t& oldestSequence, uint32_t& newestSequence) const override {
+            if (activeRecordIdx == 0) return false;
+            newestSequence = memory[activePageIdx].records[activeRecordIdx - 1].sequence;
+            // CORRECTED: Read actual record sequence, not the hardcoded page header
+            oldestSequence = memory[activePageIdx].records[0].sequence; 
+            return true;
+        }
+
+        bool readBatch(uint32_t startSequence, LogRecord* outRecords, size_t capacity, size_t& count) override {
+            count = 0;
+            for (uint32_t i = 0; i < activeRecordIdx && count < capacity; i++) {
+                if (memory[activePageIdx].records[i].sequence >= startSequence) {
+                    outRecords[count++] = memory[activePageIdx].records[i];
+                }
+            }
+            return count > 0;
+        }
+
+    private:
+        void rotatePage() {
+            uint32_t newPageSeq = memory[activePageIdx].header.pageSequence + 1;
+            uint32_t nextRecSeq = memory[activePageIdx].records[RECORDS_PER_PAGE - 1].sequence + 1;
+            
+            activePageIdx = (activePageIdx + 1) % NUM_PAGES;
+            activeRecordIdx = 0;
+            
+            // Erase new page
+            memset(&memory[activePageIdx], 0xFF, sizeof(MockPage));
+            
+            // Setup new header
+            memory[activePageIdx].header.magic = PAGE_VALIDATION_SIGNATURE;
+            memory[activePageIdx].header.formatVersion = 1;
+            memory[activePageIdx].header.pageSequence = newPageSeq;
+            memory[activePageIdx].header.firstRecordSequence = nextRecSeq;
+            memory[activePageIdx].header.crc32 = calculateHeaderCrc(memory[activePageIdx].header);
+        }
+
+        uint16_t calculateRecordCrc(const LogRecord& rec) const {
+            // Dummy XOR CRC for testing purposes
+            uint16_t crc = 0;
+            crc ^= rec.sequence;
+            crc ^= rec.timestampMs;
+            crc ^= rec.eventType;
+            return crc;
+        }
+
+        uint32_t calculateHeaderCrc(const PageHeader& hdr) const {
+            return hdr.pageSequence ^ hdr.firstRecordSequence ^ hdr.magic;
+        }
+    };
+}
+
+#endif // MOCK_EVENT_STORAGE_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_offline_storage\test_offline_storage.cpp =====
+
+// ========================================================================================================
+// File: test_offline_storage.cpp
+// Purpose: Validates the M4.1 Storage Contracts (Recovery, Power-Loss, CRC, and Pagination).
+// ========================================================================================================
+
+#include <Arduino.h>
+#include <unity.h>
+#include "MockEventStorage.hpp"
+
+using namespace StepMaster::Storage;
+using namespace StepMaster::Storage::Test;
+
+// Allocated in global memory once (takes ~130KB of RAM)
+MockEventStorage storage;
+
+void setUp(void) {
+    storage.format(); // Reset storage to factory state before every test
+}
+
+void tearDown(void) {}
+
+void test_format_and_initial_state() {
+    uint32_t oldest, newest;
+    bool hasData = storage.getRange(oldest, newest);
+    
+    // Freshly formatted storage should have no complete records
+    TEST_ASSERT_FALSE(hasData);
+    TEST_ASSERT_EQUAL(0, storage.activePageIdx);
+    TEST_ASSERT_EQUAL(0, storage.activeRecordIdx);
+}
+
+void test_append_and_read_records() {
+    LogRecord rec1 = {1001, 1, 5000, 1, 0, 0, 0}; // seq: 1001, type: STEP
+    LogRecord rec2 = {1002, 1, 6000, 2, 0, 0, 0}; // seq: 1002, type: JUMP
+
+    TEST_ASSERT_TRUE(storage.appendRecord(rec1));
+    TEST_ASSERT_TRUE(storage.appendRecord(rec2));
+
+    uint32_t oldest, newest;
+    TEST_ASSERT_TRUE(storage.getRange(oldest, newest));
+    TEST_ASSERT_EQUAL_UINT32(1001, oldest);
+    TEST_ASSERT_EQUAL_UINT32(1002, newest);
+
+    LogRecord batch[5];
+    size_t count = 0;
+    storage.readBatch(1001, batch, 5, count);
+    
+    TEST_ASSERT_EQUAL_size_t(2, count);
+    TEST_ASSERT_EQUAL_UINT32(1001, batch[0].sequence);
+    TEST_ASSERT_EQUAL_UINT8(1, batch[0].eventType);
+    TEST_ASSERT_EQUAL_UINT32(1002, batch[1].sequence);
+}
+
+void test_power_loss_recovery_ignores_incomplete_record() {
+    // Write 2 valid records
+    LogRecord rec1 = {1001, 1, 5000, 1, 0, 0, 0};
+    LogRecord rec2 = {1002, 1, 6000, 1, 0, 0, 0};
+    storage.appendRecord(rec1);
+    storage.appendRecord(rec2);
+
+    // Simulate power loss on the 3rd record
+    LogRecord rec3 = {1003, 1, 7000, 1, 0, 0, 0};
+    storage.simulatePowerLoss = true; 
+    storage.appendRecord(rec3); // This will write 0xFFFFFFFF to commitWord
+
+    // Simulate device reboot by dropping the RAM state (but keeping the array memory intact)
+    storage.activePageIdx = 0;
+    storage.activeRecordIdx = 0;
+    
+    TEST_ASSERT_TRUE(storage.initAndRecover());
+    
+    // Recovery should stop at record 2, ignoring the incomplete record 3
+    TEST_ASSERT_EQUAL(2, storage.activeRecordIdx);
+    
+    uint32_t oldest, newest;
+    storage.getRange(oldest, newest);
+    TEST_ASSERT_EQUAL_UINT32(1002, newest); // Sequence 1003 is safely ignored
+}
+
+void test_crc_corruption_rejection() {
+    LogRecord rec1 = {1001, 1, 5000, 1, 0, 0, 0};
+    storage.appendRecord(rec1);
+
+    LogRecord rec2 = {1002, 1, 6000, 1, 0, 0, 0};
+    storage.simulateCrcCorruption = true;
+    storage.appendRecord(rec2); // Record written but with bad CRC
+
+    // Simulate device reboot
+    storage.activePageIdx = 0;
+    storage.activeRecordIdx = 0;
+    storage.initAndRecover();
+    
+    // Recovery should ignore record 2 due to bad CRC
+    TEST_ASSERT_EQUAL(1, storage.activeRecordIdx);
+}
+
+void setup() {
+    delay(2000);
+    UNITY_BEGIN();
+    RUN_TEST(test_format_and_initial_state);
+    RUN_TEST(test_append_and_read_records);
+    RUN_TEST(test_power_loss_recovery_ignores_incomplete_record);
+    RUN_TEST(test_crc_corruption_rejection);
+    UNITY_END();
+}
+
+void loop() {
+    delay(100);
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_sync_manager\test_sync_manager.cpp =====
+
+// ========================================================================================================
+// File: test_sync_manager.cpp
+// Purpose: Validates Resumable Bulk Sync logic, Cumulative ACKs, and Batch progression.
+// ========================================================================================================
+
+#include <Arduino.h>
+#include <unity.h>
+#include "storage/SyncManager.hpp"
+#include <vector>
+
+using namespace StepMaster::Storage;
+
+// --- Minimal Mocks for TDD ---
+class MockEventStorage : public IEventStorage {
+public:
+    std::vector<LogRecord> records;
+    
+    bool initAndRecover() override { return true; }
+    bool appendRecord(const LogRecord& record) override {
+        records.push_back(record);
+        return true;
+    }
+    bool getRange(uint32_t& oldest, uint32_t& newest) const override {
+        if (records.empty()) return false;
+        oldest = records.front().sequence;
+        newest = records.back().sequence;
+        return true;
+    }
+    bool readBatch(uint32_t startSeq, LogRecord* outRecords, size_t cap, size_t& count) override {
+        count = 0;
+        for (const auto& r : records) {
+            // Using sequence comparison to find records belonging to the requested batch
+            if (!isSequenceNewer(startSeq, r.sequence) && count < cap) {
+                outRecords[count++] = r;
+            }
+        }
+        return count > 0;
+    }
+    bool format() override { records.clear(); return true; }
+    bool eraseAll() override { return format(); }
+};
+
+class MockBulkTransport : public IBulkTransport {
+public:
+    std::vector<LogRecord> sentRecords;
+    bool shouldFail = false;
+
+    bool sendBatch(const LogRecord* records, size_t count) override {
+        if (shouldFail) return false;
+        for (size_t i = 0; i < count; i++) {
+            sentRecords.push_back(records[i]);
+        }
+        return true;
+    }
+};
+
+// --- Test Cases ---
+void test_sync_starts_batches_and_completes() {
+    MockEventStorage storage;
+    MockBulkTransport transport;
+    SyncManager syncManager(storage, transport);
+
+    // Simulate 12 historical events logged offline
+    for (uint32_t i = 1; i <= 12; i++) {
+        storage.appendRecord({i, 1, i*100, 1, 0, 0, 0});
+    }
+
+    syncManager.beginSync(1);
+    TEST_ASSERT_TRUE(syncManager.isSyncInProgress());
+
+    // 12 records at 5 per batch = 3 poll cycles
+    syncManager.poll(); // Sent 1-5
+    syncManager.poll(); // Sent 6-10
+    syncManager.poll(); // Sent 11-12
+    
+    TEST_ASSERT_EQUAL_size_t(12, transport.sentRecords.size());
+    TEST_ASSERT_EQUAL_UINT32(12, transport.sentRecords.back().sequence);
+
+    // App acknowledges processing up to record 12
+    syncManager.acknowledge(12);
+    TEST_ASSERT_FALSE(syncManager.isSyncInProgress()); // Sync completed
+}
+
+void test_sync_resumes_cleanly_after_disconnect() {
+    MockEventStorage storage;
+    MockBulkTransport transport;
+    SyncManager syncManager(storage, transport);
+
+    for (uint32_t i = 1001; i <= 1010; i++) {
+        storage.appendRecord({i, 1, i*100, 1, 0, 0, 0});
+    }
+
+    syncManager.beginSync(1001);
+    syncManager.poll(); // Sends 1001-1005
+    
+    TEST_ASSERT_EQUAL_size_t(5, transport.sentRecords.size());
+    
+    // Simulate App ACKing up to 1003, then BLE disconnects abruptly
+    syncManager.acknowledge(1003);
+    
+    // App reconnects, logically requesting to resume from 1004
+    syncManager.beginSync(1004);
+    syncManager.poll(); // Sends 1004-1008
+    syncManager.poll(); // Sends 1009-1010
+    
+    // Total physical transmissions = 5 (first batch) + 5 + 2 = 12 operations
+    TEST_ASSERT_EQUAL_size_t(12, transport.sentRecords.size()); 
+    TEST_ASSERT_EQUAL_UINT32(1010, transport.sentRecords.back().sequence);
+    
+    syncManager.acknowledge(1010);
+    TEST_ASSERT_FALSE(syncManager.isSyncInProgress());
+}
+
+// === GLOBAL SCOPE FUNCTIONS ===
+void setUp(void) {}
+void tearDown(void) {}
+
+void setup() {
+    delay(2000);
+    UNITY_BEGIN();
+    
+    RUN_TEST(test_sync_starts_batches_and_completes);
+    RUN_TEST(test_sync_resumes_cleanly_after_disconnect);
+    
+    UNITY_END();
+}
+
+void loop() {
+    delay(100);
+}
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_time_service\MockStateStorage.hpp =====
+
+// ========================================================================================================
+// File: MockStateStorage.hpp
+// Purpose: In-memory simulation of the static Flash checkpoint area for M4.2 unit tests.
+// ========================================================================================================
+
+#ifndef MOCK_STATE_STORAGE_HPP
+#define MOCK_STATE_STORAGE_HPP
+
+#include "storage/StorageInterfaces.hpp"
+
+namespace StepMaster {
+namespace Storage {
+namespace Test {
+
+    class MockStateStorage : public IStateStorage {
+    public:
+        PersistentState memory{};
+        bool isFormatted = false;
+
+        bool loadState(PersistentState& outState) override {
+            if (!isFormatted) return false;
+            outState = memory;
+            return true;
+        }
+
+        bool saveState(const PersistentState& state) override {
+            memory = state;
+            isFormatted = true;
+            return true;
+        }
+    };
+
+} // namespace Test
+} // namespace Storage
+} // namespace StepMaster
+
+#endif // MOCK_STATE_STORAGE_HPP
+
+===== FILE: C:\Users\eilla\Documents\StepMaster\Ankle_Motion_Tracker\test\test_time_service\test_time_service.cpp =====
+
+// ========================================================================================================
+// File: test_time_service.cpp
+// Purpose: Validates time anchoring, Unix Epoch translations, and Session ID continuity across reboots.
+// ========================================================================================================
+
+#include <Arduino.h>
+#include <unity.h>
+#include "storage/TimeManager.hpp"
+#include "MockStateStorage.hpp"
+
+using namespace StepMaster::Storage;
+using namespace StepMaster::Storage::Test;
+
+// Allocated globally to persist data across simulated reboots
+MockStateStorage stateStorage;
+TimeManager* timeManager;
+
+void setUp(void) {
+    // We intentionally DO NOT clear stateStorage here so we can simulate reboots between tests
+}
+
+void tearDown(void) {
+    delete timeManager;
+}
+
+void test_fresh_boot_creates_session_1() {
+    stateStorage.isFormatted = false; // Force a factory reset
+    timeManager = new TimeManager(stateStorage);
+    
+    TEST_ASSERT_TRUE(timeManager->begin());
+    TEST_ASSERT_EQUAL_UINT32(1, timeManager->getCurrentSessionId());
+}
+
+void test_reboot_increments_session() {
+    // The previous test left the stateStorage intact (Session 1)
+    // Creating a new TimeManager simulates a hard reboot reading from the same Flash
+    timeManager = new TimeManager(stateStorage);
+    
+    TEST_ASSERT_TRUE(timeManager->begin());
+    TEST_ASSERT_EQUAL_UINT32(2, timeManager->getCurrentSessionId());
+}
+
+void test_epoch_sync_and_time_progression() {
+    timeManager = new TimeManager(stateStorage);
+    timeManager->begin();
+    
+    // Initially unsynced. Circumventing 64-bit Unity limit using standard boolean check.
+    TEST_ASSERT_TRUE(timeManager->getUnixEpoch() == 0); 
+    
+    uint64_t simulatedPhoneTimeMs = 1700000000000ULL; // Standard Unix Timestamp
+    timeManager->syncEpoch(simulatedPhoneTimeMs);
+    
+    delay(50); // Advance uptime by 50ms
+    
+    uint64_t currentTime = timeManager->getUnixEpoch();
+    
+    // Circumventing 64-bit Unity limit using standard boolean checks.
+    TEST_ASSERT_TRUE(currentTime >= simulatedPhoneTimeMs + 50);
+    TEST_ASSERT_TRUE(currentTime < simulatedPhoneTimeMs + 100);
+}
+
+// === GLOBAL SCOPE FUNCTIONS ===
+void setup() {
+    delay(2000);
+    UNITY_BEGIN();
+    
+    RUN_TEST(test_fresh_boot_creates_session_1);
+    RUN_TEST(test_reboot_increments_session);
+    RUN_TEST(test_epoch_sync_and_time_progression);
+    
+    UNITY_END();
+}
+
+void loop() {
+    delay(100);
+}
