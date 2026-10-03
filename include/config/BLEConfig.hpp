@@ -13,19 +13,10 @@ namespace BLEConfig {
     // ----------------------------------------------------------------------------------------------------
     // Custom StepMaster Service UUIDs
     // ----------------------------------------------------------------------------------------------------
-    // Primary Service UUID for StepMaster telemetry
     constexpr const char* SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0";
-    
-    // Characteristic UUID for transmitting total steps
     constexpr const char* CHAR_STEPS_UUID = "12345678-1234-5678-1234-56789abcdef1";
-    
-    // Characteristic UUID for transmitting total jumps
     constexpr const char* CHAR_JUMPS_UUID = "12345678-1234-5678-1234-56789abcdef2";
-    
-    // Characteristic UUID for transmitting total stairs
     constexpr const char* CHAR_STAIRS_UUID = "12345678-1234-5678-1234-56789abcdef3";
-    
-    // Characteristic UUID for transmitting the current motion state
     constexpr const char* CHAR_STATE_UUID = "12345678-1234-5678-1234-56789abcdef4";
 
     // ----------------------------------------------------------------------------------------------------
@@ -33,6 +24,12 @@ namespace BLEConfig {
     // ----------------------------------------------------------------------------------------------------
     constexpr const char* BATTERY_SERVICE_UUID = "180F";
     constexpr const char* BATTERY_LEVEL_CHAR_UUID = "2A19";
+
+    // ----------------------------------------------------------------------------------------------------
+    // Nordic Secure DFU Service UUIDs
+    // ----------------------------------------------------------------------------------------------------
+    constexpr const char* DFU_SERVICE_UUID = "FE59";
+    constexpr const char* DFU_CONTROL_CHAR_UUID = "8EC90001-F315-4F60-9FB8-838830DAEA50";
 }
 
 #endif // BLE_CONFIG_HPP
